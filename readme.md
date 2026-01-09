@@ -3,7 +3,7 @@
 
 [<img align="right" src="https://dev.azure.com/Daan0324/mimalloc/_apis/build/status/microsoft.mimalloc?branchName=dev"/>](https://dev.azure.com/Daan0324/mimalloc/_build?definitionId=1&_a=summary)
 
-# mimalloc
+# mimalloc for Android
 
 &nbsp;
 
@@ -15,6 +15,114 @@ Initially developed by Daan Leijen for the runtime systems of the
 Latest release   : `v3.1.5` (beta) (2025-06-13).  
 Latest v2 release: `v2.2.4` (2025-06-09).  
 Latest v1 release: `v1.9.4` (2024-06-09).
+
+# Integration for AOSP
+
+(Take LineageOS 23.0 source as example)
+To make it works on your build, you needs to take care of bionic library
+
+### 1. Add it into visibility whitelist
+
+Open file
+
+>bionic/libc/Android.bp
+
+```
+cc_library_headers {
+    name: "libc_headers",
+    host_supported: true,
+    native_bridge_supported: true,
+    vendor_available: true,
+    product_available: true,
+    ramdisk_available: true,
+    vendor_ramdisk_available: true,
+    recovery_available: true,
+    sdk_version: "1",
+
+    apex_available: [
+        "//apex_available:platform",
+        "//apex_available:anyapex",
+    ],
+    // used by most APEXes indirectly via libunwind_llvm
+    min_sdk_version: "apex_inherit",
+    visibility: [
+        "//bionic:__subpackages__", // visible to bionic
+        // ... and only to these places (b/152668052)
+        "//external/arm-optimized-routines",
+        "//external/gwp_asan",
+        "//external/jemalloc_new",
+        "//external/libunwind_llvm",
+        "//external/llvm-libc",
+        "//external/scudo",
+        "//system/core/property_service/libpropertyinfoparser",
+        "//system/extras/toolchain-extras",
++        "//external/mimalloc",
+    ], 
+```
+
+### 2. Tell Soong to build with mimalloc
+Still bionic/libc/Android.bp in step 1
+```
+cc_defaults {
+    name: "libc_native_allocator_defaults",
+
+    whole_static_libs: [
+        "libscudo",
++        "libmimalloc",
+    ],
+    cflags: [
++        "-DUSE_MIMALLOC",
+        "-DUSE_SCUDO",
+    ],
+    header_libs: ["gwp_asan_headers"],
+    product_variables: {
+        malloc_low_memory: {
+            cflags: ["-UUSE_SCUDO"],
+            whole_static_libs: [
+                "libjemalloc5",
+                "libc_jemalloc_wrapper",
+            ],
+            exclude_static_libs: [
+                "libscudo",
++                "libmimalloc",
+            ],
+        },
+    },
+}
+```
+
+### 3. Replace scudo/jemalloc with mimalloc
+From the design of bionic header, we know Malloc funcs are actually pluggable in source code, so we just need to write a header that "tells" bionic the corresponding Malloc interface of mimalloc (Don't worry I've done it check [mimalloc_adapt.h](https://github.com/WeiguangTWK/android_external_mimalloc/blob/23.0/include/mimalloc_adapt.h)) and then include it in malloc_common.h
+
+Open file
+>bionic/libc/bionic/malloc_common.h
+
+```
++#if defined(USE_MIMALLOC)
++
++#include <mimalloc_adapt.h>
++#define Malloc(function)  mimalloc_ ## function
++
+-#if defined(USE_SCUDO)
++#elif defined(USE_SCUDO)
+
+#include "scudo.h"
+#define Malloc(function)  scudo_ ## function
+
+#elif defined(USE_SCUDO_SVELTE)
+
+#include "scudo.h"
+#define Malloc(function)  scudo_svelte_ ## function
+
+#else
+
+#include "jemalloc.h"
+#define Malloc(function)  je_ ## function
+
+#endif
+```
+
+WELL DONE! New run the compile and wish no errors thrown:)
 
 mimalloc is a drop-in replacement for `malloc` and can be used in other programs
 without code changes, for example, on dynamically linked ELF-based systems (Linux, BSD, etc.) you can use it as:
