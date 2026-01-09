@@ -1,0 +1,145 @@
+//
+// Copyright (C) 2022 Acme
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+
+package {
+    default_applicable_licenses: ["external_mimalloc_license"],
+}
+
+license {
+    name: "external_mimalloc_license",
+    visibility: [":__subpackages__"],
+    license_kinds: [
+        "SPDX-license-identifier-MIT",
+    ],
+    license_text: [
+        "LICENSE",
+    ],
+}
+
+common_cflags = [
+    "-DNDEBUG",
+    "-Ofast",
+    "-fPIC",
+    "-Wall",
+    "-Wextra",
+    "-fvisibility=hidden",
+    "-ftls-model=initial-exec",
+    "-funroll-loops",
+    "-fno-emulated-tls",
+    "-D__linux__",
+    "-D__ANDROID__",
+
+    // The following flags are for avoiding errors when compiling.
+    "-Wno-static-in-inline",
+    "-Wno-unused-parameter",
+    "-Wno-unused-function",
+    "-Wno-missing-field-initializers",
+    "-Wno-date-time",
+]
+
+common_c_local_includes = [
+    "src",
+    "include",
+]
+
+cc_defaults {
+    name: "mimalloc_defaults",
+    defaults: ["linux_bionic_supported"],
+    host_supported: true,
+    native_bridge_supported: true,
+    cflags: common_cflags,
+    c_std: "gnu11",
+    local_include_dirs: common_c_local_includes,
+    header_libs: [
+        "libc_headers",
+    ],
+    export_header_lib_headers: ["libc_headers"],
+    stl: "none",
+}
+
+lib_srcs = [
+    "src/static.c",
+]
+
+cc_library {
+    name: "libmimalloc",
+    ramdisk_available: true,
+    vendor_ramdisk_available: true,
+    recovery_available: true,
+
+    defaults: ["mimalloc_defaults"],
+
+    srcs: lib_srcs,
+
+    shared_libs: [
+    ],
+
+    export_include_dirs: ["include"],
+
+    target: {
+        android: {
+            shared: {
+                enabled: false,
+            },
+            system_shared_libs: [],
+        },
+        linux_bionic: {
+            system_shared_libs: [],
+        },
+    },
+
+    apex_available: [
+        "com.android.runtime",
+    ],
+
+    lto: {
+        never: true,
+    },
+}
+
+cc_library_shared {
+    name: "libmimalloc_shared",
+    defaults: ["mimalloc_defaults"],
+    srcs: lib_srcs,
+    export_include_dirs: ["include"],
+    system_shared_libs: [],
+    apex_available: [
+        "com.android.runtime",
+    ],
+    lto: {
+        never: true,
+    },
+}
+
+cc_test {
+    name: "mimalloc-test-stress",
+    defaults: ["mimalloc_defaults"],
+    gtest: false,
+    static_libs: ["libmimalloc"],
+    srcs: [
+        "test/test-stress.c",
+    ],
+}
+
+cc_test {
+    name: "mimalloc-test-api",
+    defaults: ["mimalloc_defaults"],
+    gtest: false,
+    static_libs: ["libmimalloc"],
+    srcs: [
+        "test/test-api.c",
+    ],
+}
