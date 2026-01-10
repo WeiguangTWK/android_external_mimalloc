@@ -50,10 +50,17 @@ size_t mi_malloc_usable_size(const void* p);
 void* mi_memalign(size_t alignment, size_t size);
 int   mi_posix_memalign(void** p, size_t alignment, size_t size);
 void* mi_aligned_alloc(size_t alignment, size_t size);
+void  mi_collect(bool force);
+void  mi_option_set(int option, long value);
 #if defined(HAVE_DEPRECATED_MALLOC_FUNCS)
 void* mi_valloc(size_t size);
 void* mi_pvalloc(size_t size);
 #endif
+
+// Minimal option values from mimalloc.h (mi_option_t enum).
+enum {
+  MI_OPTION_PURGE_DELAY = 15,
+};
 
 static inline void* mimalloc_aligned_alloc(size_t alignment, size_t size) {
   return mi_aligned_alloc(alignment, size);
@@ -88,9 +95,34 @@ static inline size_t mimalloc_malloc_usable_size(const void* mem) {
 }
 
 static inline int mimalloc_mallopt(int param, int value) {
-  (void)param;
-  (void)value;
-  return 0;
+  switch (param) {
+    case M_DECAY_TIME:
+      if (value < -1 || value > 1) return 0;
+      if (value < 0) {
+        mi_option_set(MI_OPTION_PURGE_DELAY, -1);
+      } else if (value == 0) {
+        mi_option_set(MI_OPTION_PURGE_DELAY, 0);
+      } else {
+        mi_option_set(MI_OPTION_PURGE_DELAY, 10);
+      }
+      return 1;
+    case M_PURGE:
+    case M_PURGE_ALL:
+      mi_collect(true);
+      return 1;
+    case M_MEMTAG_TUNING:
+    case M_THREAD_DISABLE_MEM_INIT:
+    case M_CACHE_COUNT_MAX:
+    case M_CACHE_SIZE_MAX:
+    case M_TSDS_COUNT_MAX:
+    case M_BIONIC_ZERO_INIT:
+    case M_BIONIC_SET_HEAP_TAGGING_LEVEL:
+    case M_LOG_STATS:
+      (void)value;
+      return 1;
+    default:
+      return 0;
+  }
 }
 
 static inline void* mimalloc_memalign(size_t alignment, size_t bytes) {
