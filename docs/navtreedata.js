@@ -26,9 +26,11 @@ var NAVTREE =
 [
   [ "mi-malloc", "index.html", [
     [ "Building", "build.html", null ],
-    [ "Using the library", "using.html", null ],
+    [ "Using the Library", "using.html", null ],
     [ "Environment Options", "environment.html", null ],
     [ "Overriding Malloc", "overrides.html", null ],
+    [ "Build Modes", "modes.html", null ],
+    [ "Tools", "tools.html", null ],
     [ "Performance", "bench.html", null ],
     [ "Topics", "topics.html", "topics" ],
     [ "Data Structures", "annotated.html", [
@@ -44,8 +46,9 @@ var NAVTREE =
 
 var NAVTREEINDEX =
 [
-"annotated.html"
+"annotated.html",
+"group__typed.html#ga02d3e85bf26aa3120132f2552c408a88"
 ];
 
-var SYNCONMSG = 'click to disable panel synchronization';
-var SYNCOFFMSG = 'click to enable panel synchronization';
+var SYNCONMSG = 'click to disable panel synchronisation';
+var SYNCOFFMSG = 'click to enable panel synchronisation';

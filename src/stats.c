@@ -476,12 +476,11 @@ mi_decl_export void mi_process_info(size_t* elapsed_msecs, size_t* user_msecs, s
 // Return statistics
 // --------------------------------------------------------
 
-void mi_stats_get(size_t stats_size, mi_stats_t* stats) mi_attr_noexcept {
-  if (stats == NULL || stats_size == 0) return;
-  _mi_memzero(stats, stats_size);
-  const size_t size = (stats_size > sizeof(mi_stats_t) ? sizeof(mi_stats_t) : stats_size);
-  _mi_memcpy(stats, &_mi_stats_main, size);
-  stats->version = MI_STAT_VERSION;
+bool mi_stats_get(mi_stats_t* stats) mi_attr_noexcept {
+  if (stats == NULL || stats->size != sizeof(mi_stats_t) || stats->version != MI_STAT_VERSION) return false;
+  _mi_memzero(stats,stats->size);
+  _mi_memcpy(stats, &_mi_stats_main, sizeof(mi_stats_t));
+  return true;
 }
 
 
@@ -589,7 +588,7 @@ char* mi_stats_get_json(size_t output_size, char* output_buf) mi_attr_noexcept {
     if (!mi_heap_buf_expand(&hbuf)) return NULL;
   }
   mi_heap_buf_print(&hbuf, "{\n");
-  mi_heap_buf_print_value(&hbuf, "version", MI_STAT_VERSION);
+  mi_heap_buf_print_value(&hbuf, "stat_version", MI_STAT_VERSION);
   mi_heap_buf_print_value(&hbuf, "mimalloc_version", MI_MALLOC_VERSION);
 
   // process info
@@ -629,5 +628,12 @@ char* mi_stats_get_json(size_t output_size, char* output_buf) mi_attr_noexcept {
   }
   mi_heap_buf_print(&hbuf, "  ]\n");
   mi_heap_buf_print(&hbuf, "}\n");
-  return hbuf.buf;
+  if (hbuf.used >= hbuf.size) {
+    // failed
+    if (hbuf.can_realloc) { mi_free(hbuf.buf); }
+    return NULL;
+  }
+  else {
+    return hbuf.buf;
+  }
 }
