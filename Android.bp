@@ -41,6 +41,7 @@ common_cflags = [
     "-fno-emulated-tls",
     "-D__linux__",
     "-D__ANDROID__",
+    "-DMI_VISIT_ABANDONED",
 
     // The following flags are for avoiding errors when compiling.
     "-Wno-static-in-inline",
@@ -72,6 +73,7 @@ cc_defaults {
 
 lib_srcs = [
     "src/static.c",
+    "src/android-adapt.c",
 ]
 
 cc_library {
