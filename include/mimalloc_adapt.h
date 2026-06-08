@@ -29,11 +29,13 @@
 #pragma once
 
 #include <errno.h>
+#include <stdbool.h>
+#include <limits.h>
 #include <malloc.h>
+#include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <stdatomic.h>
 
 #include <private/bionic_config.h>
 
@@ -41,53 +43,138 @@
 
 __BEGIN_DECLS
 
-// Minimal C API declarations to avoid pulling C++ STL headers from mimalloc.h.
 void* mi_malloc(size_t size);
 void* mi_calloc(size_t count, size_t size);
 void* mi_realloc(void* p, size_t newsize);
-void  mi_free(void* p);
+void mi_free(void* p);
 size_t mi_malloc_usable_size(const void* p);
 void* mi_memalign(size_t alignment, size_t size);
-int   mi_posix_memalign(void** p, size_t alignment, size_t size);
+int mi_posix_memalign(void** p, size_t alignment, size_t size);
 void* mi_aligned_alloc(size_t alignment, size_t size);
-void  mi_collect(bool force);
-void  mi_option_set(int option, long value);
+void mi_collect(bool force);
+void mi_option_set(int option, long value);
+typedef void mi_output_fun(const char* msg, void* arg);
+void mi_stats_print_out(mi_output_fun* out, void* arg);
+struct mallinfo mimalloc_helper_mallinfo(void);
+int mimalloc_helper_malloc_info(int options, FILE* fp);
+int mimalloc_helper_malloc_iterate(uintptr_t base, size_t size,
+                                   void (*callback)(uintptr_t base, size_t size, void* arg),
+                                   void* arg);
 #if defined(HAVE_DEPRECATED_MALLOC_FUNCS)
 void* mi_valloc(size_t size);
 void* mi_pvalloc(size_t size);
 #endif
 
-// Minimal option values from mimalloc.h (mi_option_t enum).
 enum {
-  MI_OPTION_PURGE_DELAY = 15,
+  mi_option_purge_delay = 15,
 };
 
+static pthread_mutex_t g_mimalloc_disable_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_mimalloc_disable_cond = PTHREAD_COND_INITIALIZER;
+static bool g_mimalloc_disabled = false;
+static size_t g_mimalloc_active_calls = 0;
+#ifdef __cplusplus
+static thread_local size_t g_mimalloc_reentry_depth = 0;
+#else
+static _Thread_local size_t g_mimalloc_reentry_depth = 0;
+#endif
+
+static inline size_t mimalloc_next_pow2(size_t value) {
+  if (value <= 1) return 1;
+  const size_t original = value;
+  value--;
+  for (size_t shift = 1; shift < sizeof(value) * 8; shift <<= 1) {
+    value |= value >> shift;
+  }
+  value++;
+  return (value < original ? 0 : value);
+}
+
+static inline size_t mimalloc_memalign_alignment(size_t alignment) {
+  alignment = mimalloc_next_pow2(alignment);
+  if (alignment < sizeof(void*)) alignment = sizeof(void*);
+  return alignment;
+}
+
+static inline void mimalloc_operation_begin() {
+  if (g_mimalloc_reentry_depth++ != 0) return;
+
+  pthread_mutex_lock(&g_mimalloc_disable_lock);
+  while (g_mimalloc_disabled) {
+    pthread_cond_wait(&g_mimalloc_disable_cond, &g_mimalloc_disable_lock);
+  }
+  g_mimalloc_active_calls++;
+  pthread_mutex_unlock(&g_mimalloc_disable_lock);
+}
+
+static inline void mimalloc_operation_end() {
+  if (--g_mimalloc_reentry_depth != 0) return;
+
+  pthread_mutex_lock(&g_mimalloc_disable_lock);
+  g_mimalloc_active_calls--;
+  if (g_mimalloc_disabled && g_mimalloc_active_calls == 0) {
+    pthread_cond_broadcast(&g_mimalloc_disable_cond);
+  }
+  pthread_mutex_unlock(&g_mimalloc_disable_lock);
+}
+
+static inline void mimalloc_log_output(const char* msg, void* arg) {
+  (void)arg;
+  async_safe_format_log(ANDROID_LOG_INFO, "mimalloc", "%s", msg);
+}
+
 static inline void* mimalloc_aligned_alloc(size_t alignment, size_t size) {
-  return mi_aligned_alloc(alignment, size);
+  if (alignment == 0 || (alignment & (alignment - 1)) != 0 || (size % alignment) != 0) {
+    errno = EINVAL;
+    return NULL;
+  }
+  mimalloc_operation_begin();
+  void* p = mi_aligned_alloc(alignment, size);
+  mimalloc_operation_end();
+  return p;
 }
 
 static inline void* mimalloc_calloc(size_t n_elements, size_t elem_size) {
-  return mi_calloc(n_elements, elem_size);
+  mimalloc_operation_begin();
+  void* p = mi_calloc(n_elements, elem_size);
+  mimalloc_operation_end();
+  return p;
 }
 
 static inline void mimalloc_free(void* mem) {
+  mimalloc_operation_begin();
   mi_free(mem);
+  mimalloc_operation_end();
 }
 
 static inline struct mallinfo mimalloc_mallinfo() {
-  struct mallinfo info = {};
+  mimalloc_operation_begin();
+  struct mallinfo info = mimalloc_helper_mallinfo();
+  mimalloc_operation_end();
   return info;
 }
 
 static inline void* mimalloc_malloc(size_t bytes) {
-  return mi_malloc(bytes);
+  mimalloc_operation_begin();
+  void* p = mi_malloc(bytes);
+  mimalloc_operation_end();
+  return p;
 }
 
 static inline int mimalloc_malloc_info(int options, FILE* fp) {
-  (void)options;
-  (void)fp;
-  errno = ENOTSUP;
-  return -1;
+  if (options != 0) {
+    errno = EINVAL;
+    return -1;
+  }
+  if (fp == NULL) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  mimalloc_operation_begin();
+  int result = mimalloc_helper_malloc_info(options, fp);
+  mimalloc_operation_end();
+  return result;
 }
 
 static inline size_t mimalloc_malloc_usable_size(const void* mem) {
@@ -98,17 +185,21 @@ static inline int mimalloc_mallopt(int param, int value) {
   switch (param) {
     case M_DECAY_TIME:
       if (value < -1 || value > 1) return 0;
+      mimalloc_operation_begin();
       if (value < 0) {
-        mi_option_set(MI_OPTION_PURGE_DELAY, -1);
+        mi_option_set(mi_option_purge_delay, -1);
       } else if (value == 0) {
-        mi_option_set(MI_OPTION_PURGE_DELAY, 0);
+        mi_option_set(mi_option_purge_delay, 0);
       } else {
-        mi_option_set(MI_OPTION_PURGE_DELAY, 10);
+        mi_option_set(mi_option_purge_delay, 1000);
       }
+      mimalloc_operation_end();
       return 1;
     case M_PURGE:
     case M_PURGE_ALL:
+      mimalloc_operation_begin();
       mi_collect(true);
+      mimalloc_operation_end();
       return 1;
     case M_MEMTAG_TUNING:
     case M_THREAD_DISABLE_MEM_INIT:
@@ -117,8 +208,13 @@ static inline int mimalloc_mallopt(int param, int value) {
     case M_TSDS_COUNT_MAX:
     case M_BIONIC_ZERO_INIT:
     case M_BIONIC_SET_HEAP_TAGGING_LEVEL:
+      (void)value;
+      return 1;
     case M_LOG_STATS:
       (void)value;
+      mimalloc_operation_begin();
+      mi_stats_print_out(mimalloc_log_output, NULL);
+      mimalloc_operation_end();
       return 1;
     default:
       return 0;
@@ -126,39 +222,67 @@ static inline int mimalloc_mallopt(int param, int value) {
 }
 
 static inline void* mimalloc_memalign(size_t alignment, size_t bytes) {
-  return mi_memalign(alignment, bytes);
+  alignment = mimalloc_memalign_alignment(alignment);
+  if (alignment == 0) {
+    errno = EINVAL;
+    return NULL;
+  }
+  mimalloc_operation_begin();
+  void* p = mi_memalign(alignment, bytes);
+  mimalloc_operation_end();
+  return p;
 }
 
 static inline void* mimalloc_realloc(void* old_mem, size_t bytes) {
-  return mi_realloc(old_mem, bytes);
+  mimalloc_operation_begin();
+  void* p = mi_realloc(old_mem, bytes);
+  mimalloc_operation_end();
+  return p;
 }
 
 static inline int mimalloc_posix_memalign(void** memptr, size_t alignment, size_t size) {
-  return mi_posix_memalign(memptr, alignment, size);
+  mimalloc_operation_begin();
+  int result = mi_posix_memalign(memptr, alignment, size);
+  mimalloc_operation_end();
+  return result;
 }
 
 #if defined(HAVE_DEPRECATED_MALLOC_FUNCS)
 static inline void* mimalloc_pvalloc(size_t bytes) {
-  return mi_pvalloc(bytes);
+  mimalloc_operation_begin();
+  void* p = mi_pvalloc(bytes);
+  mimalloc_operation_end();
+  return p;
 }
 
 static inline void* mimalloc_valloc(size_t bytes) {
-  return mi_valloc(bytes);
+  mimalloc_operation_begin();
+  void* p = mi_valloc(bytes);
+  mimalloc_operation_end();
+  return p;
 }
 #endif
 
 static inline int mimalloc_malloc_iterate(uintptr_t base, size_t size,
                                           void (*callback)(uintptr_t base, size_t size, void* arg),
                                           void* arg) {
-  (void)base;
-  (void)size;
-  (void)callback;
-  (void)arg;
-  return 0;
+  return mimalloc_helper_malloc_iterate(base, size, callback, arg);
 }
 
-static inline void mimalloc_malloc_disable() {}
+static inline void mimalloc_malloc_disable() {
+  pthread_mutex_lock(&g_mimalloc_disable_lock);
+  g_mimalloc_disabled = true;
+  while (g_mimalloc_active_calls != 0) {
+    pthread_cond_wait(&g_mimalloc_disable_cond, &g_mimalloc_disable_lock);
+  }
+  pthread_mutex_unlock(&g_mimalloc_disable_lock);
+}
 
-static inline void mimalloc_malloc_enable() {}
+static inline void mimalloc_malloc_enable() {
+  pthread_mutex_lock(&g_mimalloc_disable_lock);
+  g_mimalloc_disabled = false;
+  pthread_cond_broadcast(&g_mimalloc_disable_cond);
+  pthread_mutex_unlock(&g_mimalloc_disable_lock);
+}
 
 __END_DECLS
