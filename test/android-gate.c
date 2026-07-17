@@ -64,12 +64,17 @@ static void* allocation_worker(void* arg) {
 }
 
 static void* cross_thread_enabler(void* arg) {
-  (void)arg;
   int err;
   do {
     err = sem_wait(&enable_request);
   } while (err != 0 && errno == EINTR);
   TEST_CHECK(err == 0);
+
+  // free(NULL) is required to be a no-op even while allocations are disabled.
+  // libmemunreachable relies on this when stdio cleanup runs in its ptracer
+  // thread before the original thread can re-enable the allocator.
+  TEST_CHECK(arg == NULL);
+  mimalloc_free(arg);
   mimalloc_malloc_enable();
   return NULL;
 }

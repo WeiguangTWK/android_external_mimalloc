@@ -118,6 +118,7 @@ static inline void* mimalloc_calloc(size_t n_elements, size_t elem_size) {
 }
 
 static inline void mimalloc_free(void* mem) {
+  if (mem == NULL) return;
   mimalloc_operation_begin();
   mi_free(mem);
   mimalloc_operation_end();
