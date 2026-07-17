@@ -1,11 +1,145 @@
 #include "mimalloc.h"
 #include "mimalloc-stats.h"
+#include "mimalloc_android_gate.h"
 #include "mimalloc/types.h"
 
 #include <limits.h>
 #include <malloc.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
+
+_Atomic(uint32_t) g_mimalloc_gate_state = MIMALLOC_GATE_UNINITIALIZED;
+_Atomic(uint32_t) g_mimalloc_gate_next_lane = 0;
+mimalloc_gate_lane_t g_mimalloc_gate_lanes[MIMALLOC_GATE_LANE_COUNT];
+_Thread_local uint32_t g_mimalloc_gate_lane = MIMALLOC_GATE_UNASSIGNED_LANE;
+_Thread_local size_t g_mimalloc_gate_reentry_depth = 0;
+
+static pthread_mutex_t g_mimalloc_gate_wait_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_mimalloc_gate_wait_cond = PTHREAD_COND_INITIALIZER;
+
+static bool mimalloc_gate_has_active_calls(void) {
+  for (size_t i = 0; i < MIMALLOC_GATE_LANE_COUNT; i++) {
+    if (atomic_load_explicit(&g_mimalloc_gate_lanes[i].active, memory_order_seq_cst) != 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void mimalloc_gate_wait_until_open(void) {
+  pthread_mutex_lock(&g_mimalloc_gate_wait_lock);
+  while (atomic_load_explicit(&g_mimalloc_gate_state, memory_order_seq_cst) !=
+         MIMALLOC_GATE_OPEN) {
+    pthread_cond_wait(&g_mimalloc_gate_wait_cond, &g_mimalloc_gate_wait_lock);
+  }
+  pthread_mutex_unlock(&g_mimalloc_gate_wait_lock);
+}
+
+void mimalloc_gate_notify_lane_drained(void) {
+  pthread_mutex_lock(&g_mimalloc_gate_wait_lock);
+  pthread_cond_broadcast(&g_mimalloc_gate_wait_cond);
+  pthread_mutex_unlock(&g_mimalloc_gate_wait_lock);
+}
+
+void mimalloc_gate_disable(void) {
+  mimalloc_gate_ensure_initialized();
+
+  for (;;) {
+    uint32_t expected = MIMALLOC_GATE_OPEN;
+    if (atomic_compare_exchange_strong_explicit(&g_mimalloc_gate_state, &expected,
+                                                MIMALLOC_GATE_CLOSING, memory_order_seq_cst,
+                                                memory_order_seq_cst)) {
+      break;
+    }
+    mimalloc_gate_wait_until_open();
+  }
+
+  pthread_mutex_lock(&g_mimalloc_gate_wait_lock);
+  while (mimalloc_gate_has_active_calls()) {
+    pthread_cond_wait(&g_mimalloc_gate_wait_cond, &g_mimalloc_gate_wait_lock);
+  }
+  atomic_store_explicit(&g_mimalloc_gate_state, MIMALLOC_GATE_CLOSED, memory_order_seq_cst);
+  pthread_cond_broadcast(&g_mimalloc_gate_wait_cond);
+  pthread_mutex_unlock(&g_mimalloc_gate_wait_lock);
+}
+
+void mimalloc_gate_enable(void) {
+  mimalloc_gate_ensure_initialized();
+
+  pthread_mutex_lock(&g_mimalloc_gate_wait_lock);
+  while (atomic_load_explicit(&g_mimalloc_gate_state, memory_order_seq_cst) ==
+         MIMALLOC_GATE_CLOSING) {
+    pthread_cond_wait(&g_mimalloc_gate_wait_cond, &g_mimalloc_gate_wait_lock);
+  }
+  if (atomic_load_explicit(&g_mimalloc_gate_state, memory_order_seq_cst) ==
+      MIMALLOC_GATE_CLOSED) {
+    atomic_store_explicit(&g_mimalloc_gate_state, MIMALLOC_GATE_OPEN, memory_order_seq_cst);
+    pthread_cond_broadcast(&g_mimalloc_gate_wait_cond);
+  }
+  pthread_mutex_unlock(&g_mimalloc_gate_wait_lock);
+}
+
+static void mimalloc_gate_atfork_prepare(void) {
+  mimalloc_gate_disable();
+}
+
+static void mimalloc_gate_atfork_parent(void) {
+  mimalloc_gate_enable();
+}
+
+static void mimalloc_gate_atfork_child(void) {
+  // Only the thread that called fork survives in the child. Recreate the
+  // process-private slow-path synchronization objects instead of inheriting
+  // waiter bookkeeping from threads that no longer exist.
+  pthread_mutex_init(&g_mimalloc_gate_wait_lock, NULL);
+  pthread_cond_init(&g_mimalloc_gate_wait_cond, NULL);
+  for (size_t i = 0; i < MIMALLOC_GATE_LANE_COUNT; i++) {
+    atomic_store_explicit(&g_mimalloc_gate_lanes[i].active, 0, memory_order_seq_cst);
+  }
+  g_mimalloc_gate_reentry_depth = 0;
+  atomic_store_explicit(&g_mimalloc_gate_state, MIMALLOC_GATE_OPEN, memory_order_seq_cst);
+}
+
+void mimalloc_gate_ensure_initialized(void) {
+  for (;;) {
+    uint32_t state = atomic_load_explicit(&g_mimalloc_gate_state, memory_order_seq_cst);
+    if (state >= MIMALLOC_GATE_OPEN) return;
+
+    if (state == MIMALLOC_GATE_UNINITIALIZED) {
+      uint32_t expected = MIMALLOC_GATE_UNINITIALIZED;
+      if (atomic_compare_exchange_strong_explicit(&g_mimalloc_gate_state, &expected,
+                                                  MIMALLOC_GATE_INITIALIZING,
+                                                  memory_order_seq_cst,
+                                                  memory_order_seq_cst)) {
+        bool set_reentry_guard = (g_mimalloc_gate_reentry_depth == 0);
+        if (set_reentry_guard) g_mimalloc_gate_reentry_depth = 1;
+        int err = pthread_atfork(mimalloc_gate_atfork_prepare, mimalloc_gate_atfork_parent,
+                                 mimalloc_gate_atfork_child);
+        if (set_reentry_guard) g_mimalloc_gate_reentry_depth = 0;
+        // Failing to install atfork handlers must not make the allocator
+        // unavailable. The gate remains usable, but fork synchronization is
+        // not provided for this process.
+        (void)err;
+
+        pthread_mutex_lock(&g_mimalloc_gate_wait_lock);
+        atomic_store_explicit(&g_mimalloc_gate_state, MIMALLOC_GATE_OPEN,
+                              memory_order_seq_cst);
+        pthread_cond_broadcast(&g_mimalloc_gate_wait_cond);
+        pthread_mutex_unlock(&g_mimalloc_gate_wait_lock);
+        return;
+      }
+      continue;
+    }
+
+    pthread_mutex_lock(&g_mimalloc_gate_wait_lock);
+    while (atomic_load_explicit(&g_mimalloc_gate_state, memory_order_seq_cst) ==
+           MIMALLOC_GATE_INITIALIZING) {
+      pthread_cond_wait(&g_mimalloc_gate_wait_cond, &g_mimalloc_gate_wait_lock);
+    }
+    pthread_mutex_unlock(&g_mimalloc_gate_wait_lock);
+  }
+}
 
 typedef struct mimalloc_iterate_arg_s {
   uintptr_t base;

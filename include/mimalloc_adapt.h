@@ -37,9 +37,9 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#include <private/bionic_config.h>
-
 #include <async_safe/log.h>
+
+#include "mimalloc_android_gate.h"
 
 __BEGIN_DECLS
 
@@ -69,16 +69,6 @@ enum {
   mi_option_purge_delay = 15,
 };
 
-static pthread_mutex_t g_mimalloc_disable_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t g_mimalloc_disable_cond = PTHREAD_COND_INITIALIZER;
-static bool g_mimalloc_disabled = false;
-static size_t g_mimalloc_active_calls = 0;
-#ifdef __cplusplus
-static thread_local size_t g_mimalloc_reentry_depth = 0;
-#else
-static _Thread_local size_t g_mimalloc_reentry_depth = 0;
-#endif
-
 static inline size_t mimalloc_next_pow2(size_t value) {
   if (value <= 1) return 1;
   const size_t original = value;
@@ -97,25 +87,11 @@ static inline size_t mimalloc_memalign_alignment(size_t alignment) {
 }
 
 static inline void mimalloc_operation_begin() {
-  if (g_mimalloc_reentry_depth++ != 0) return;
-
-  pthread_mutex_lock(&g_mimalloc_disable_lock);
-  while (g_mimalloc_disabled) {
-    pthread_cond_wait(&g_mimalloc_disable_cond, &g_mimalloc_disable_lock);
-  }
-  g_mimalloc_active_calls++;
-  pthread_mutex_unlock(&g_mimalloc_disable_lock);
+  mimalloc_gate_enter();
 }
 
 static inline void mimalloc_operation_end() {
-  if (--g_mimalloc_reentry_depth != 0) return;
-
-  pthread_mutex_lock(&g_mimalloc_disable_lock);
-  g_mimalloc_active_calls--;
-  if (g_mimalloc_disabled && g_mimalloc_active_calls == 0) {
-    pthread_cond_broadcast(&g_mimalloc_disable_cond);
-  }
-  pthread_mutex_unlock(&g_mimalloc_disable_lock);
+  mimalloc_gate_leave();
 }
 
 static inline void mimalloc_log_output(const char* msg, void* arg) {
@@ -270,19 +246,11 @@ static inline int mimalloc_malloc_iterate(uintptr_t base, size_t size,
 }
 
 static inline void mimalloc_malloc_disable() {
-  pthread_mutex_lock(&g_mimalloc_disable_lock);
-  g_mimalloc_disabled = true;
-  while (g_mimalloc_active_calls != 0) {
-    pthread_cond_wait(&g_mimalloc_disable_cond, &g_mimalloc_disable_lock);
-  }
-  pthread_mutex_unlock(&g_mimalloc_disable_lock);
+  mimalloc_gate_disable();
 }
 
 static inline void mimalloc_malloc_enable() {
-  pthread_mutex_lock(&g_mimalloc_disable_lock);
-  g_mimalloc_disabled = false;
-  pthread_cond_broadcast(&g_mimalloc_disable_cond);
-  pthread_mutex_unlock(&g_mimalloc_disable_lock);
+  mimalloc_gate_enable();
 }
 
 __END_DECLS

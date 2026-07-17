@@ -66,8 +66,12 @@ cc_defaults {
     local_include_dirs: common_c_local_includes,
     header_libs: [
         "libc_headers",
+        "libasync_safe_headers",
     ],
-    export_header_lib_headers: ["libc_headers"],
+    export_header_lib_headers: [
+        "libc_headers",
+        "libasync_safe_headers",
+    ],
     stl: "none",
 }
 
@@ -143,5 +147,25 @@ cc_test {
     static_libs: ["libmimalloc"],
     srcs: [
         "test/test-api.c",
+    ],
+}
+
+cc_test {
+    name: "mimalloc-test-android-gate",
+    defaults: ["mimalloc_defaults"],
+    gtest: false,
+    static_libs: ["libmimalloc"],
+    srcs: [
+        "test/android-gate.c",
+    ],
+}
+
+cc_test {
+    name: "mimalloc-bench-android-gate",
+    defaults: ["mimalloc_defaults"],
+    gtest: false,
+    static_libs: ["libmimalloc"],
+    srcs: [
+        "test/android-gate-bench.c",
     ],
 }
