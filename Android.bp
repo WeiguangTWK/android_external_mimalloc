@@ -188,3 +188,13 @@ cc_test {
         "test/android-purge.c",
     ],
 }
+
+cc_test {
+    name: "mimalloc-test-android-mallinfo",
+    defaults: ["mimalloc_defaults"],
+    gtest: false,
+    static_libs: ["libmimalloc"],
+    srcs: [
+        "test/android-mallinfo.c",
+    ],
+}

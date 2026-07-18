@@ -3,7 +3,6 @@
 #include "mimalloc_android_gate.h"
 #include "mimalloc/types.h"
 
-#include <limits.h>
 #include <malloc.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -306,19 +305,116 @@ mi_decl_export void mimalloc_helper_purge_all(void) {
   _mi_arenas_collect(true);
 }
 
+typedef struct mimalloc_mallinfo_snapshot_s {
+  size_t allocated;
+  size_t free;
+} mimalloc_mallinfo_snapshot_t;
+
+static size_t mimalloc_saturating_multiply(size_t left, size_t right) {
+  if (left != 0 && right > SIZE_MAX / left) return SIZE_MAX;
+  return left * right;
+}
+
+static void mimalloc_saturating_add(size_t* total, size_t value) {
+  if (value > SIZE_MAX - *total) {
+    *total = SIZE_MAX;
+  } else {
+    *total += value;
+  }
+}
+
+static void mimalloc_saturating_subtract(size_t* total, size_t value) {
+  *total = (value >= *total ? 0 : *total - value);
+}
+
+static void mimalloc_snapshot_segment(mi_segment_t* segment, void* arg) {
+  mimalloc_mallinfo_snapshot_t* snapshot = (mimalloc_mallinfo_snapshot_t*)arg;
+  const mi_slice_t* end;
+  mi_slice_t* slice = mi_slices_start_iterate(segment, &end);
+
+  while (slice < end) {
+    if (mi_slice_is_used(slice)) {
+      mi_page_t* page = mi_slice_to_page(slice);
+      _mi_page_free_collect(page, true);
+      const size_t usable = mi_page_usable_block_size(page);
+      const size_t used = page->used;
+      const size_t available = (used <= page->capacity ? page->capacity - used : 0);
+      mimalloc_saturating_add(
+          &snapshot->allocated, mimalloc_saturating_multiply(used, usable));
+      mimalloc_saturating_add(
+          &snapshot->free, mimalloc_saturating_multiply(available, usable));
+    }
+    slice += slice->slice_count;
+  }
+}
+
+static void mimalloc_snapshot_heap_delayed_frees(mi_heap_t* heap,
+                                                 mimalloc_mallinfo_snapshot_t* snapshot) {
+  // The first cross-thread free from a full page is linked on the owning
+  // heap instead of page->xthread_free. It is already logically free, but is
+  // still included in page->used until the owner processes the delayed list.
+  // The gate makes this list stable, so account for it without processing it
+  // from a thread that does not own the heap.
+  mi_block_t* block =
+      mi_atomic_load_ptr_acquire(mi_block_t, &heap->thread_delayed_free);
+  while (block != NULL) {
+    mi_segment_t* segment = _mi_ptr_segment(block);
+    mi_page_t* page = _mi_segment_page_of(segment, block);
+    const size_t usable = mi_page_usable_block_size(page);
+    mimalloc_saturating_subtract(&snapshot->allocated, usable);
+    mimalloc_saturating_add(&snapshot->free, usable);
+    block = mi_block_nextx(heap, block, heap->keys);
+  }
+}
+
+static void mimalloc_snapshot_all_delayed_frees(
+    mimalloc_mallinfo_snapshot_t* snapshot) {
+  uintptr_t after = 0;
+  for (;;) {
+    mimalloc_find_heap_arg_t find = {.after = after, .next = NULL};
+    mimalloc_visit_all_segments(mimalloc_find_next_heap_in_segment, &find);
+    if (find.next == NULL) break;
+    mimalloc_snapshot_heap_delayed_frees(find.next, snapshot);
+    after = (uintptr_t)find.next;
+  }
+}
+
+static size_t mimalloc_main_stat_current(const mi_stat_count_t* stat) {
+  int64_t current =
+      mi_atomic_loadi64_relaxed((_Atomic(int64_t)*)&stat->current);
+  return (current > 0 ? (size_t)current : 0);
+}
+
 mi_decl_export struct mallinfo mimalloc_helper_mallinfo(void) {
   struct mallinfo info = {};
-  mi_stats_t_decl(stats);
-  if (mi_stats_get(&stats)) {
-    size_t current_allocated = (size_t)(stats.malloc_normal.current + stats.malloc_huge.current);
-    size_t current_commit = (size_t)stats.committed.current;
-    info.uordblks = current_allocated > INT_MAX ? INT_MAX : (int)current_allocated;
-    info.hblkhd = current_commit > INT_MAX ? INT_MAX : (int)current_commit;
-    if (current_commit >= current_allocated) {
-      size_t free_bytes = current_commit - current_allocated;
-      info.fordblks = free_bytes > INT_MAX ? INT_MAX : (int)free_bytes;
-    }
-  }
+  mimalloc_mallinfo_snapshot_t snapshot = {};
+  mimalloc_visit_all_segments(mimalloc_snapshot_segment, &snapshot);
+  mimalloc_snapshot_all_delayed_frees(&snapshot);
+
+  info.uordblks = snapshot.allocated;
+  // This is a conservative lower bound: immediately reusable capacity in
+  // active pages. It deliberately excludes metadata and unassigned spans.
+  info.fsmblks = snapshot.free;
+  info.fordblks = snapshot.free;
+  // Android exposes usmblks as Native Heap Size. Arena reservations and even
+  // assigned segments can be orders of magnitude larger than their live
+  // pages. Report the usable capacity managed by active pages so Heap Size is
+  // the saturating sum of Heap Alloc and Heap Free.
+  info.hblkhd = info.uordblks;
+  mimalloc_saturating_add(&info.hblkhd, info.fordblks);
+  info.usmblks = info.hblkhd;
+  return info;
+}
+
+mi_decl_export struct mallinfo mimalloc_helper_mallinfo_reentrant(void) {
+  struct mallinfo info = {};
+  info.uordblks = mimalloc_main_stat_current(&_mi_stats_main.malloc_normal);
+  mimalloc_saturating_add(
+      &info.uordblks, mimalloc_main_stat_current(&_mi_stats_main.malloc_huge));
+  // A reentrant call cannot safely take a process-wide page snapshot. With no
+  // reusable-capacity estimate available, Heap Size equals known live bytes.
+  info.hblkhd = info.uordblks;
+  info.usmblks = info.uordblks;
   return info;
 }
 

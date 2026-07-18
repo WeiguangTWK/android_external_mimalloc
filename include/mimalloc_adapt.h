@@ -58,6 +58,7 @@ void mi_option_set(int option, long value);
 typedef void mi_output_fun(const char* msg, void* arg);
 void mi_stats_print_out(mi_output_fun* out, void* arg);
 struct mallinfo mimalloc_helper_mallinfo(void);
+struct mallinfo mimalloc_helper_mallinfo_reentrant(void);
 int mimalloc_helper_malloc_info(int options, FILE* fp);
 void mimalloc_helper_purge_all(void);
 int mimalloc_helper_malloc_iterate(uintptr_t base, size_t size,
@@ -128,9 +129,14 @@ static inline void mimalloc_free(void* mem) {
 }
 
 static inline struct mallinfo mimalloc_mallinfo() {
-  mimalloc_operation_begin();
+  if (g_mimalloc_gate_reentry_depth != 0) {
+    return mimalloc_helper_mallinfo_reentrant();
+  }
+  mimalloc_gate_disable();
+  g_mimalloc_gate_reentry_depth = 1;
   struct mallinfo info = mimalloc_helper_mallinfo();
-  mimalloc_operation_end();
+  g_mimalloc_gate_reentry_depth = 0;
+  mimalloc_gate_enable();
   return info;
 }
 
