@@ -76,8 +76,7 @@ cc_defaults {
 }
 
 lib_srcs = [
-    "src/static.c",
-    "src/android-adapt.c",
+    "src/android-static.c",
 ]
 
 cc_library {
@@ -167,5 +166,15 @@ cc_test {
     static_libs: ["libmimalloc"],
     srcs: [
         "test/android-gate-bench.c",
+    ],
+}
+
+cc_test {
+    name: "mimalloc-test-android-iterate",
+    defaults: ["mimalloc_defaults"],
+    gtest: false,
+    static_libs: ["libmimalloc"],
+    srcs: [
+        "test/android-iterate.c",
     ],
 }

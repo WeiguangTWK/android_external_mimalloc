@@ -179,6 +179,81 @@ static bool mimalloc_visit_block(const mi_heap_t* heap, const mi_heap_area_t* ar
   return true;
 }
 
+static bool mimalloc_segment_is_valid(const mi_segment_t* segment) {
+  if (_mi_ptr_cookie(segment) != segment->cookie) return false;
+  if (segment->segment_size == 0 ||
+      segment->segment_size % MI_SEGMENT_SLICE_SIZE != 0) {
+    return false;
+  }
+  if (segment->kind != MI_SEGMENT_NORMAL && segment->kind != MI_SEGMENT_HUGE) return false;
+  if (segment->slice_entries == 0 || segment->slice_entries > MI_SLICES_PER_SEGMENT) return false;
+  if (segment->segment_info_slices == 0 ||
+      segment->segment_info_slices > segment->slice_entries) {
+    return false;
+  }
+  return true;
+}
+
+static void mimalloc_visit_segment(mi_segment_t* segment, mimalloc_iterate_arg_t* iterate_arg) {
+  if (segment->used == 0) return;
+  (void)_mi_segment_visit_blocks(segment, -1, true, mimalloc_visit_block, iterate_arg);
+}
+
+static void mimalloc_visit_arena_segments(mimalloc_iterate_arg_t* iterate_arg) {
+  size_t arena_count = mi_arena_get_count();
+  if (arena_count > MI_MAX_ARENAS) arena_count = MI_MAX_ARENAS;
+
+  for (size_t arena_index = 0; arena_index < arena_count; arena_index++) {
+    mi_arena_t* arena = mi_arena_from_index(arena_index);
+    if (arena == NULL) continue;
+
+    for (size_t field = 0; field < arena->field_count; field++) {
+      size_t inuse = mi_atomic_load_relaxed(&arena->blocks_inuse[field]);
+      while (inuse != 0) {
+        const size_t bit = mi_ctz(inuse);
+        const mi_bitmap_index_t block_index = mi_bitmap_index_create(field, bit);
+        inuse &= inuse - 1;
+        if (mi_bitmap_index_bit(block_index) >= arena->block_count) continue;
+
+        mi_segment_t* segment = (mi_segment_t*)mi_arena_block_start(arena, block_index);
+        if (segment->memid.memkind != MI_MEM_ARENA ||
+            segment->memid.mem.arena.id != arena->id ||
+            segment->memid.mem.arena.block_index != block_index ||
+            !mimalloc_segment_is_valid(segment)) {
+          continue;
+        }
+        mimalloc_visit_segment(segment, iterate_arg);
+      }
+    }
+  }
+}
+
+static void mimalloc_visit_os_segments(mimalloc_iterate_arg_t* iterate_arg) {
+  for (size_t part_index = 0; part_index < MI_SEGMENT_MAP_MAX_PARTS; part_index++) {
+    mi_segmap_part_t* part =
+        mi_atomic_load_ptr_acquire(mi_segmap_part_t, &mi_segment_map[part_index]);
+    if (part == NULL) continue;
+
+    for (size_t field = 0; field < MI_SEGMENT_MAP_PART_ENTRIES; field++) {
+      uintptr_t allocated = mi_atomic_load_relaxed(&part->map[field]);
+      while (allocated != 0) {
+        const size_t bit = mi_ctz(allocated);
+        allocated &= allocated - 1;
+
+        const uintptr_t part_base = (uintptr_t)part_index * MI_SEGMENT_MAP_PART_SPAN;
+        const uintptr_t bit_index = (uintptr_t)field * MI_INTPTR_BITS + bit;
+        mi_segment_t* segment =
+            (mi_segment_t*)(part_base + bit_index * MI_SEGMENT_MAP_PART_BIT_SPAN);
+        if (segment->memid.memkind == MI_MEM_ARENA ||
+            !mimalloc_segment_is_valid(segment)) {
+          continue;
+        }
+        mimalloc_visit_segment(segment, iterate_arg);
+      }
+    }
+  }
+}
+
 mi_decl_export struct mallinfo mimalloc_helper_mallinfo(void) {
   struct mallinfo info = {};
   mi_stats_t_decl(stats);
@@ -232,13 +307,7 @@ mi_decl_export int mimalloc_helper_malloc_iterate(
   iterate_arg.callback = callback;
   iterate_arg.arg = arg;
 
-  mi_heap_t* backing = mi_heap_get_backing();
-  if (backing != NULL && backing->tld != NULL) {
-    for (mi_heap_t* heap = backing->tld->heaps; heap != NULL; heap = heap->next) {
-      mi_heap_visit_blocks(heap, true, mimalloc_visit_block, &iterate_arg);
-    }
-    mi_abandoned_visit_blocks(backing->tld->segments.subproc, -1, true, mimalloc_visit_block,
-                              &iterate_arg);
-  }
+  mimalloc_visit_arena_segments(&iterate_arg);
+  mimalloc_visit_os_segments(&iterate_arg);
   return 0;
 }
