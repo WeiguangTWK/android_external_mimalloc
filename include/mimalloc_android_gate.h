@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2026 The Android Open Source Project
+ * Copyright (C) 2026 Neko LineageOS
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
