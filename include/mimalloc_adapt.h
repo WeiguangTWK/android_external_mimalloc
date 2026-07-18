@@ -52,11 +52,14 @@ void* mi_memalign(size_t alignment, size_t size);
 int mi_posix_memalign(void** p, size_t alignment, size_t size);
 void* mi_aligned_alloc(size_t alignment, size_t size);
 void mi_collect(bool force);
+#ifndef MIMALLOC_H
 void mi_option_set(int option, long value);
+#endif
 typedef void mi_output_fun(const char* msg, void* arg);
 void mi_stats_print_out(mi_output_fun* out, void* arg);
 struct mallinfo mimalloc_helper_mallinfo(void);
 int mimalloc_helper_malloc_info(int options, FILE* fp);
+void mimalloc_helper_purge_all(void);
 int mimalloc_helper_malloc_iterate(uintptr_t base, size_t size,
                                    void (*callback)(uintptr_t base, size_t size, void* arg),
                                    void* arg);
@@ -65,9 +68,9 @@ void* mi_valloc(size_t size);
 void* mi_pvalloc(size_t size);
 #endif
 
-enum {
-  mi_option_purge_delay = 15,
-};
+#ifndef MIMALLOC_H
+enum { mi_option_purge_delay = 15 };
+#endif
 
 static inline size_t mimalloc_next_pow2(size_t value) {
   if (value <= 1) return 1;
@@ -173,10 +176,24 @@ static inline int mimalloc_mallopt(int param, int value) {
       mimalloc_operation_end();
       return 1;
     case M_PURGE:
-    case M_PURGE_ALL:
       mimalloc_operation_begin();
       mi_collect(true);
       mimalloc_operation_end();
+      return 1;
+    case M_PURGE_ALL:
+      // Enter from outside the gate: closing it while counted as an active
+      // operation would wait for this call's own lane to drain.
+      if (g_mimalloc_gate_reentry_depth != 0) {
+        mi_collect(true);
+        return 1;
+      }
+      mimalloc_gate_disable();
+      // Internal deferred-free callbacks may reenter the public allocation
+      // wrappers. Only this purge thread is allowed through the closed gate.
+      g_mimalloc_gate_reentry_depth = 1;
+      mimalloc_helper_purge_all();
+      g_mimalloc_gate_reentry_depth = 0;
+      mimalloc_gate_enable();
       return 1;
     case M_MEMTAG_TUNING:
     case M_THREAD_DISABLE_MEM_INIT:

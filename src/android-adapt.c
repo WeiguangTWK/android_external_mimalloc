@@ -194,12 +194,9 @@ static bool mimalloc_segment_is_valid(const mi_segment_t* segment) {
   return true;
 }
 
-static void mimalloc_visit_segment(mi_segment_t* segment, mimalloc_iterate_arg_t* iterate_arg) {
-  if (segment->used == 0) return;
-  (void)_mi_segment_visit_blocks(segment, -1, true, mimalloc_visit_block, iterate_arg);
-}
+typedef void(mimalloc_segment_visitor_t)(mi_segment_t* segment, void* arg);
 
-static void mimalloc_visit_arena_segments(mimalloc_iterate_arg_t* iterate_arg) {
+static void mimalloc_visit_arena_segments(mimalloc_segment_visitor_t* visitor, void* arg) {
   size_t arena_count = mi_arena_get_count();
   if (arena_count > MI_MAX_ARENAS) arena_count = MI_MAX_ARENAS;
 
@@ -222,13 +219,13 @@ static void mimalloc_visit_arena_segments(mimalloc_iterate_arg_t* iterate_arg) {
             !mimalloc_segment_is_valid(segment)) {
           continue;
         }
-        mimalloc_visit_segment(segment, iterate_arg);
+        if (segment->used != 0) visitor(segment, arg);
       }
     }
   }
 }
 
-static void mimalloc_visit_os_segments(mimalloc_iterate_arg_t* iterate_arg) {
+static void mimalloc_visit_os_segments(mimalloc_segment_visitor_t* visitor, void* arg) {
   for (size_t part_index = 0; part_index < MI_SEGMENT_MAP_MAX_PARTS; part_index++) {
     mi_segmap_part_t* part =
         mi_atomic_load_ptr_acquire(mi_segmap_part_t, &mi_segment_map[part_index]);
@@ -248,10 +245,65 @@ static void mimalloc_visit_os_segments(mimalloc_iterate_arg_t* iterate_arg) {
             !mimalloc_segment_is_valid(segment)) {
           continue;
         }
-        mimalloc_visit_segment(segment, iterate_arg);
+        if (segment->used != 0) visitor(segment, arg);
       }
     }
   }
+}
+
+static void mimalloc_visit_all_segments(mimalloc_segment_visitor_t* visitor, void* arg) {
+  mimalloc_visit_arena_segments(visitor, arg);
+  mimalloc_visit_os_segments(visitor, arg);
+}
+
+static void mimalloc_iterate_segment(mi_segment_t* segment, void* arg) {
+  (void)_mi_segment_visit_blocks(segment, -1, true, mimalloc_visit_block, arg);
+}
+
+typedef struct mimalloc_find_heap_arg_s {
+  uintptr_t after;
+  mi_heap_t* next;
+} mimalloc_find_heap_arg_t;
+
+static void mimalloc_find_next_heap_in_segment(mi_segment_t* segment, void* arg) {
+  mimalloc_find_heap_arg_t* find = (mimalloc_find_heap_arg_t*)arg;
+  const mi_slice_t* end;
+  mi_slice_t* slice = mi_slices_start_iterate(segment, &end);
+
+  while (slice < end) {
+    if (mi_slice_is_used(slice)) {
+      mi_heap_t* heap = mi_page_heap(mi_slice_to_page(slice));
+      const uintptr_t address = (uintptr_t)heap;
+      if (address > find->after &&
+          (find->next == NULL || address < (uintptr_t)find->next)) {
+        find->next = heap;
+      }
+    }
+    slice += slice->slice_count;
+  }
+}
+
+mi_decl_export void mimalloc_helper_purge_all(void) {
+  // Collect the caller's default heap first. Besides being inexpensive, this
+  // also handles abandoned segments in the default subprocess.
+  mi_collect(true);
+
+  // Collecting a heap may free its segments and mutate the global indexes.
+  // Find one heap at a time in address order and restart the scan after each
+  // collection. This avoids allocating a temporary registry while the gate is
+  // closed and keeps all bookkeeping off the allocation hot path.
+  uintptr_t after = 0;
+  for (;;) {
+    mimalloc_find_heap_arg_t find = {.after = after, .next = NULL};
+    mimalloc_visit_all_segments(mimalloc_find_next_heap_in_segment, &find);
+    if (find.next == NULL) break;
+    mi_heap_collect(find.next, true);
+    after = (uintptr_t)find.next;
+  }
+
+  // Heap collection already visits arenas, but do one final forced pass after
+  // all pages and segments released above have been scheduled for purging.
+  _mi_arenas_collect(true);
 }
 
 mi_decl_export struct mallinfo mimalloc_helper_mallinfo(void) {
@@ -307,7 +359,6 @@ mi_decl_export int mimalloc_helper_malloc_iterate(
   iterate_arg.callback = callback;
   iterate_arg.arg = arg;
 
-  mimalloc_visit_arena_segments(&iterate_arg);
-  mimalloc_visit_os_segments(&iterate_arg);
+  mimalloc_visit_all_segments(mimalloc_iterate_segment, &iterate_arg);
   return 0;
 }
