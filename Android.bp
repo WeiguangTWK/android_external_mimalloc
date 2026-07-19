@@ -198,3 +198,13 @@ cc_test {
         "test/android-mallinfo.c",
     ],
 }
+
+cc_test {
+    name: "mimalloc-test-android-malloc-info",
+    defaults: ["mimalloc_defaults"],
+    gtest: false,
+    static_libs: ["libmimalloc"],
+    srcs: [
+        "test/android-malloc-info.c",
+    ],
+}

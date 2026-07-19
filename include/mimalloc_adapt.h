@@ -59,7 +59,7 @@ typedef void mi_output_fun(const char* msg, void* arg);
 void mi_stats_print_out(mi_output_fun* out, void* arg);
 struct mallinfo mimalloc_helper_mallinfo(void);
 struct mallinfo mimalloc_helper_mallinfo_reentrant(void);
-int mimalloc_helper_malloc_info(int options, FILE* fp);
+int mimalloc_helper_malloc_info(FILE* fp, struct mallinfo info);
 void mimalloc_helper_purge_all(void);
 int mimalloc_helper_malloc_iterate(uintptr_t base, size_t size,
                                    void (*callback)(uintptr_t base, size_t size, void* arg),
@@ -157,10 +157,22 @@ static inline int mimalloc_malloc_info(int options, FILE* fp) {
     return -1;
   }
 
-  mimalloc_operation_begin();
-  int result = mimalloc_helper_malloc_info(options, fp);
-  mimalloc_operation_end();
-  return result;
+  // Flush pending output before taking the allocator snapshot. Stdio may
+  // allocate, and file I/O must not extend the process-wide gate pause.
+  if (fflush(fp) != 0) return -1;
+
+  struct mallinfo info;
+  if (g_mimalloc_gate_reentry_depth != 0) {
+    info = mimalloc_helper_mallinfo_reentrant();
+  } else {
+    mimalloc_gate_disable();
+    g_mimalloc_gate_reentry_depth = 1;
+    info = mimalloc_helper_mallinfo();
+    g_mimalloc_gate_reentry_depth = 0;
+    mimalloc_gate_enable();
+  }
+
+  return mimalloc_helper_malloc_info(fp, info);
 }
 
 static inline size_t mimalloc_malloc_usable_size(const void* mem) {

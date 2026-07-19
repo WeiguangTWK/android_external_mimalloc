@@ -147,13 +147,12 @@ typedef struct mimalloc_iterate_arg_s {
   void* arg;
 } mimalloc_iterate_arg_t;
 
-static int mimalloc_write_xml(FILE* fp, size_t current_allocated, size_t current_commit) {
+static int mimalloc_write_xml(FILE* fp, struct mallinfo info) {
   if (fprintf(fp,
-              "<malloc version=\"debug-malloc-1\">"
-              "<current_allocated>%zu</current_allocated>"
-              "<current_commit>%zu</current_commit>"
+              "<malloc version=\"mimalloc-1\">\n"
+              "  <summary allocated=\"%zu\" reusable=\"%zu\" capacity=\"%zu\"/>\n"
               "</malloc>\n",
-              current_allocated, current_commit) < 0) {
+              info.uordblks, info.fordblks, info.usmblks) < 0) {
     return -1;
   }
   return 0;
@@ -418,24 +417,8 @@ mi_decl_export struct mallinfo mimalloc_helper_mallinfo_reentrant(void) {
   return info;
 }
 
-mi_decl_export int mimalloc_helper_malloc_info(int options, FILE* fp) {
-  if (options != 0) {
-    return -1;
-  }
-  if (fp == NULL) {
-    return -1;
-  }
-
-  mi_stats_t_decl(stats);
-  size_t current_allocated = 0;
-  size_t current_commit = 0;
-  if (mi_stats_get(&stats)) {
-    current_allocated = (size_t)(stats.malloc_normal.current + stats.malloc_huge.current);
-    current_commit = (size_t)stats.committed.current;
-  }
-
-  fflush(fp);
-  if (mimalloc_write_xml(fp, current_allocated, current_commit) != 0) {
+mi_decl_export int mimalloc_helper_malloc_info(FILE* fp, struct mallinfo info) {
+  if (mimalloc_write_xml(fp, info) != 0) {
     return -1;
   }
   return fflush(fp);
