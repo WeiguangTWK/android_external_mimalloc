@@ -213,15 +213,6 @@ static inline int mimalloc_mallopt(int param, int value) {
       g_mimalloc_gate_reentry_depth = 0;
       mimalloc_gate_enable();
       return 1;
-    case M_MEMTAG_TUNING:
-    case M_THREAD_DISABLE_MEM_INIT:
-    case M_CACHE_COUNT_MAX:
-    case M_CACHE_SIZE_MAX:
-    case M_TSDS_COUNT_MAX:
-    case M_BIONIC_ZERO_INIT:
-    case M_BIONIC_SET_HEAP_TAGGING_LEVEL:
-      (void)value;
-      return 1;
     case M_LOG_STATS:
       (void)value;
       mimalloc_operation_begin();
