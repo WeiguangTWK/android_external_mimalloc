@@ -24,7 +24,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define MAX_BENCH_THREADS 16
+#define MAX_BENCH_THREADS 256U
 #define BENCHMARK_SAMPLES 3
 #define BENCHMARK_DURATION_NS 2000000000ULL
 #define WARMUP_DURATION_NS 250000000ULL
@@ -42,11 +42,22 @@ typedef struct benchmark_arg_s {
   pthread_barrier_t* barrier;
   const uint64_t* deadline_ns;
   uint64_t completed_pairs;
+  uint32_t gate_lane;
 } benchmark_arg_t;
+
+typedef struct gate_lane_stats_s {
+  size_t assigned_threads;
+  size_t occupied_lanes;
+  size_t shared_threads;
+  size_t extra_collisions;
+  size_t collision_lanes;
+  size_t max_threads_per_lane;
+} gate_lane_stats_t;
 
 typedef struct benchmark_result_s {
   double pairs_per_second;
   double nanoseconds_per_pair;
+  gate_lane_stats_t gate_lane_stats;
 } benchmark_result_t;
 
 static pthread_mutex_t old_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -79,6 +90,16 @@ static void* benchmark_worker(void* argument) {
   benchmark_arg_t* arg = (benchmark_arg_t*)argument;
   uintptr_t seed = arg->seed;
   uint64_t completed = 0;
+
+  // Assign the actual TLS lane before starting the timed region. This keeps
+  // lane initialization out of the measurements and lets the benchmark
+  // report collisions produced by the production gate implementation.
+  if (arg->mode == BENCH_GATE) {
+    mimalloc_gate_enter();
+    arg->gate_lane = g_mimalloc_gate_lane;
+    mimalloc_gate_leave();
+  }
+
   int err = pthread_barrier_wait(arg->barrier);
   if (err != 0 && err != PTHREAD_BARRIER_SERIAL_THREAD) fail("pthread_barrier_wait", err);
 
@@ -131,6 +152,7 @@ static benchmark_result_t run_benchmark(benchmark_mode_t mode, size_t thread_cou
     args[i].barrier = &barrier;
     args[i].deadline_ns = &deadline_ns;
     args[i].completed_pairs = 0;
+    args[i].gate_lane = MIMALLOC_GATE_UNASSIGNED_LANE;
     err = pthread_create(&threads[i], NULL, benchmark_worker, &args[i]);
     if (err != 0) fail("pthread_create", err);
   }
@@ -154,6 +176,31 @@ static benchmark_result_t run_benchmark(benchmark_mode_t mode, size_t thread_cou
   benchmark_result_t result;
   result.pairs_per_second = (double)pairs * 1000000000.0 / (double)elapsed;
   result.nanoseconds_per_pair = (double)elapsed / (double)pairs;
+  result.gate_lane_stats = (gate_lane_stats_t){0};
+
+  if (mode == BENCH_GATE) {
+    size_t lane_occupancy[MIMALLOC_GATE_LANE_COUNT] = {0};
+    for (size_t i = 0; i < thread_count; i++) {
+      uint32_t lane = args[i].gate_lane;
+      if (lane >= MIMALLOC_GATE_LANE_COUNT) abort();
+      lane_occupancy[lane]++;
+      result.gate_lane_stats.assigned_threads++;
+    }
+
+    for (size_t i = 0; i < MIMALLOC_GATE_LANE_COUNT; i++) {
+      size_t occupancy = lane_occupancy[i];
+      if (occupancy == 0) continue;
+      result.gate_lane_stats.occupied_lanes++;
+      if (occupancy > result.gate_lane_stats.max_threads_per_lane) {
+        result.gate_lane_stats.max_threads_per_lane = occupancy;
+      }
+      if (occupancy > 1) {
+        result.gate_lane_stats.collision_lanes++;
+        result.gate_lane_stats.shared_threads += occupancy;
+        result.gate_lane_stats.extra_collisions += occupancy - 1;
+      }
+    }
+  }
   return result;
 }
 
@@ -181,10 +228,12 @@ static void print_result(const char* name,
 
 int main(void) {
   static const char* const mode_names[] = {"direct", "gate", "old-mutex"};
-  static const size_t thread_counts[] = {1, 2, 4, 8, 16};
+  static const size_t thread_counts[] = {1, 2, 4, 8, 16, 32, 64, 128, 192, 256};
   long online_cpus = sysconf(_SC_NPROCESSORS_ONLN);
-  printf("online_cpus=%ld, samples=%u, sample_duration=%.2fs, warmup=%.2fs\n",
-         online_cpus, BENCHMARK_SAMPLES,
+  printf("online_cpus=%ld, gate_lanes=%u, max_threads=%u, samples=%u, "
+         "sample_duration=%.2fs, warmup=%.2fs\n",
+         online_cpus, MIMALLOC_GATE_LANE_COUNT, MAX_BENCH_THREADS,
+         BENCHMARK_SAMPLES,
          (double)BENCHMARK_DURATION_NS / 1000000000.0,
          (double)WARMUP_DURATION_NS / 1000000000.0);
 
@@ -222,6 +271,14 @@ int main(void) {
     }
     printf("  gate overhead vs direct: %+6.2f%%; gate speedup vs old-mutex: %.2fx\n",
            (gate_ns / direct_ns - 1.0) * 100.0, old_ns / gate_ns);
+    const gate_lane_stats_t* lane_stats =
+        &results[BENCH_GATE][BENCHMARK_SAMPLES / 2].gate_lane_stats;
+    printf("  lane assignment: assigned=%zu, occupied=%zu/%u, shared_threads=%zu, "
+           "extra_collisions=%zu, collision_lanes=%zu, max_threads/lane=%zu\n",
+           lane_stats->assigned_threads, lane_stats->occupied_lanes,
+           MIMALLOC_GATE_LANE_COUNT,
+           lane_stats->shared_threads, lane_stats->extra_collisions,
+           lane_stats->collision_lanes, lane_stats->max_threads_per_lane);
   }
   return 0;
 }
