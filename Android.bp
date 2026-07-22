@@ -42,6 +42,7 @@ common_cflags = [
     "-D__linux__",
     "-D__ANDROID__",
     "-DMI_VISIT_ABANDONED",
+    "-DMI_SECURE=4",
 
     // The following flags are for avoiding errors when compiling.
     "-Wno-static-in-inline",
