@@ -70,6 +70,7 @@ struct mallinfo mimalloc_helper_mallinfo(void);
 struct mallinfo mimalloc_helper_mallinfo_reentrant(void);
 struct mallinfo mimalloc_helper_mallinfo_snapshot(void);
 int mimalloc_helper_malloc_info(FILE* fp, struct mallinfo info);
+void mimalloc_helper_purge(void);
 void mimalloc_helper_purge_all(void);
 int mimalloc_helper_malloc_iterate(uintptr_t base, size_t size,
                                    void (*callback)(uintptr_t base, size_t size, void* arg),
@@ -204,9 +205,18 @@ static inline int mimalloc_mallopt(int param, int value) {
       mimalloc_operation_end();
       return 1;
     case M_PURGE:
-      mimalloc_operation_begin();
-      mi_collect(true);
-      mimalloc_operation_end();
+      // Stabilize the process-wide segment indexes while forcing a bounded
+      // scheduled segment purge. Unlike M_PURGE_ALL, this does not collect
+      // every live thread heap or drain its delayed frees.
+      if (g_mimalloc_gate_reentry_depth != 0) {
+        mi_collect(true);
+        return 1;
+      }
+      mimalloc_gate_disable();
+      g_mimalloc_gate_reentry_depth = 1;
+      mimalloc_helper_purge();
+      g_mimalloc_gate_reentry_depth = 0;
+      mimalloc_gate_enable();
       return 1;
     case M_PURGE_ALL:
       // Enter from outside the gate: closing it while counted as an active

@@ -282,6 +282,60 @@ static void mimalloc_find_next_heap_in_segment(mi_segment_t* segment, void* arg)
   }
 }
 
+typedef struct mimalloc_find_purge_segment_arg_s {
+  uintptr_t after;
+  mi_segment_t* next;
+} mimalloc_find_purge_segment_arg_t;
+
+// Access is serialized by the closed process-wide gate. Keep only the numeric
+// address so a segment disappearing between purge calls cannot leave a stale
+// pointer that is ever dereferenced.
+static uintptr_t g_mimalloc_purge_segment_cursor;
+
+static void mimalloc_select_next_purge_segment(mi_segment_t* segment, void* arg) {
+  if (!segment->allow_purge || segment->purge_expire == 0 ||
+      mi_commit_mask_is_empty(&segment->purge_mask)) {
+    return;
+  }
+
+  mimalloc_find_purge_segment_arg_t* find =
+      (mimalloc_find_purge_segment_arg_t*)arg;
+  const uintptr_t address = (uintptr_t)segment;
+  if (address > find->after &&
+      (find->next == NULL || address < (uintptr_t)find->next)) {
+    find->next = segment;
+  }
+}
+
+static mi_segment_t* mimalloc_find_next_purge_segment(uintptr_t after) {
+  mimalloc_find_purge_segment_arg_t find = {.after = after, .next = NULL};
+  mimalloc_visit_all_segments(mimalloc_select_next_purge_segment, &find);
+  return find.next;
+}
+
+mi_decl_export void mimalloc_helper_purge(void) {
+  // Release everything immediately available from the caller's heap first.
+  // This also performs the process-wide arena purge once.
+  mi_collect(true);
+
+  // Process at most one other live segment per normal purge. Repeated Android
+  // idle or resource purges advance the cursor, while M_PURGE_ALL remains the
+  // exhaustive operation for delayed frees and every live heap. The public
+  // wrapper holds the gate, so the segment indexes and cursor are stable here.
+  mi_segment_t* segment =
+      mimalloc_find_next_purge_segment(g_mimalloc_purge_segment_cursor);
+  if (segment == NULL && g_mimalloc_purge_segment_cursor != 0) {
+    segment = mimalloc_find_next_purge_segment(0);
+  }
+
+  if (segment == NULL) {
+    g_mimalloc_purge_segment_cursor = 0;
+  } else {
+    g_mimalloc_purge_segment_cursor = (uintptr_t)segment;
+    _mi_segment_collect(segment, true);
+  }
+}
+
 mi_decl_export void mimalloc_helper_purge_all(void) {
   // Collect the caller's default heap first. Besides being inexpensive, this
   // also handles abandoned segments in the default subprocess.

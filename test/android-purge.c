@@ -143,7 +143,8 @@ static void* purge_stress_purger(void* argument) {
   }
 
   for (size_t i = 0; i < PURGE_STRESS_ROUNDS; i++) {
-    TEST_CHECK(mimalloc_mallopt(M_PURGE_ALL, 0) == 1);
+    const int option = ((i & 1) == 0 ? M_PURGE : M_PURGE_ALL);
+    TEST_CHECK(mimalloc_mallopt(option, 0) == 1);
     atomic_fetch_add_explicit(&state->completed_purges, 1, memory_order_relaxed);
   }
   return NULL;
@@ -206,7 +207,8 @@ int main(void) {
     }
   }
 
-  // A normal purge only collects the calling thread's default heap.
+  // A normal purge collects the caller and advances bounded global segment
+  // purging, but does not exhaustively collect other live heaps.
   TEST_CHECK(mimalloc_mallopt(M_PURGE, 0) == 1);
   for (size_t i = 0; i < PURGE_WORKER_COUNT; i++) {
     TEST_CHECK(state.heaps[i]->page_count > 0);
