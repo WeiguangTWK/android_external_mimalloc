@@ -170,6 +170,29 @@ cc_test {
     ],
 }
 
+// This benchmark intentionally does not inherit mimalloc_defaults and does
+// not link libmimalloc. The same binary therefore exercises the allocator
+// exported by the device libc, allowing direct comparisons between Scudo and
+// mimalloc system images.
+cc_test {
+    name: "malloc-bench-android-system",
+    gtest: false,
+    compile_multilib: "64",
+    cflags: [
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-fno-builtin-malloc",
+        "-fno-builtin-calloc",
+        "-fno-builtin-realloc",
+        "-fno-builtin-free",
+    ],
+    srcs: [
+        "test/android-system-allocator-bench.c",
+    ],
+}
+
 cc_test {
     name: "mimalloc-test-android-iterate",
     defaults: ["mimalloc_defaults"],

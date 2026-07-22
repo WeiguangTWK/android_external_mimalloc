@@ -32,7 +32,8 @@
 
 typedef enum benchmark_mode_e {
   BENCH_DIRECT,
-  BENCH_GATE,
+  BENCH_GATE_ONLY,
+  BENCH_ADAPTER,
   BENCH_OLD_MUTEX,
 } benchmark_mode_t;
 
@@ -94,7 +95,7 @@ static void* benchmark_worker(void* argument) {
   // Assign the actual TLS lane before starting the timed region. This keeps
   // lane initialization out of the measurements and lets the benchmark
   // report collisions produced by the production gate implementation.
-  if (arg->mode == BENCH_GATE) {
+  if (arg->mode == BENCH_GATE_ONLY || arg->mode == BENCH_ADAPTER) {
     mimalloc_gate_enter();
     arg->gate_lane = g_mimalloc_gate_lane;
     mimalloc_gate_leave();
@@ -110,7 +111,14 @@ static void* benchmark_worker(void* argument) {
       if (arg->mode == BENCH_DIRECT) {
         p = mi_malloc(size);
         mi_free(p);
-      } else if (arg->mode == BENCH_GATE) {
+      } else if (arg->mode == BENCH_GATE_ONLY) {
+        mimalloc_operation_begin();
+        p = mi_malloc(size);
+        mimalloc_operation_end();
+        mimalloc_operation_begin();
+        mi_free(p);
+        mimalloc_operation_end();
+      } else if (arg->mode == BENCH_ADAPTER) {
         p = mimalloc_malloc(size);
         mimalloc_free(p);
       } else {
@@ -178,7 +186,7 @@ static benchmark_result_t run_benchmark(benchmark_mode_t mode, size_t thread_cou
   result.nanoseconds_per_pair = (double)elapsed / (double)pairs;
   result.gate_lane_stats = (gate_lane_stats_t){0};
 
-  if (mode == BENCH_GATE) {
+  if (mode == BENCH_GATE_ONLY || mode == BENCH_ADAPTER) {
     size_t lane_occupancy[MIMALLOC_GATE_LANE_COUNT] = {0};
     for (size_t i = 0; i < thread_count; i++) {
       uint32_t lane = args[i].gate_lane;
@@ -227,7 +235,8 @@ static void print_result(const char* name,
 }
 
 int main(void) {
-  static const char* const mode_names[] = {"direct", "gate", "old-mutex"};
+  static const char* const mode_names[] = {
+      "direct", "gate-only", "adapter", "old-mutex"};
   static const size_t thread_counts[] = {1, 2, 4, 8, 16, 32, 64, 128, 192, 256};
   long online_cpus = sysconf(_SC_NPROCESSORS_ONLN);
   printf("online_cpus=%ld, gate_lanes=%u, max_threads=%u, samples=%u, "
@@ -239,40 +248,48 @@ int main(void) {
 
   for (size_t i = 0; i < sizeof(thread_counts) / sizeof(thread_counts[0]); i++) {
     size_t count = thread_counts[i];
-    benchmark_result_t results[3][BENCHMARK_SAMPLES];
+    benchmark_result_t results[4][BENCHMARK_SAMPLES];
 
     // Initialize allocator state and raise the device out of its idle clock
     // state before collecting samples.
-    for (size_t mode = 0; mode < 3; mode++) {
+    for (size_t mode = 0; mode < 4; mode++) {
       (void)run_benchmark((benchmark_mode_t)mode, count, WARMUP_DURATION_NS);
     }
 
     // Rotate the mode order on every sample to distribute thermal and DVFS
     // effects instead of always favoring the first mode.
     for (size_t sample = 0; sample < BENCHMARK_SAMPLES; sample++) {
-      for (size_t offset = 0; offset < 3; offset++) {
-        size_t mode = (sample + offset) % 3;
+      for (size_t offset = 0; offset < 4; offset++) {
+        size_t mode = (sample + offset) % 4;
         results[mode][sample] =
             run_benchmark((benchmark_mode_t)mode, count, BENCHMARK_DURATION_NS);
       }
     }
 
-    for (size_t mode = 0; mode < 3; mode++) {
+    for (size_t mode = 0; mode < 4; mode++) {
       sort_results(results[mode]);
     }
 
     const double direct_ns = results[BENCH_DIRECT][BENCHMARK_SAMPLES / 2].nanoseconds_per_pair;
-    const double gate_ns = results[BENCH_GATE][BENCHMARK_SAMPLES / 2].nanoseconds_per_pair;
+    const double gate_ns =
+        results[BENCH_GATE_ONLY][BENCHMARK_SAMPLES / 2].nanoseconds_per_pair;
+    const double adapter_ns =
+        results[BENCH_ADAPTER][BENCHMARK_SAMPLES / 2].nanoseconds_per_pair;
     const double old_ns = results[BENCH_OLD_MUTEX][BENCHMARK_SAMPLES / 2].nanoseconds_per_pair;
 
     printf("threads=%zu\n", count);
-    for (size_t mode = 0; mode < 3; mode++) {
+    for (size_t mode = 0; mode < 4; mode++) {
       print_result(mode_names[mode], results[mode]);
     }
-    printf("  gate overhead vs direct: %+6.2f%%; gate speedup vs old-mutex: %.2fx\n",
-           (gate_ns / direct_ns - 1.0) * 100.0, old_ns / gate_ns);
+    printf("  gate-only overhead vs direct: %+6.2f%%\n",
+           (gate_ns / direct_ns - 1.0) * 100.0);
+    printf("  accounting overhead vs gate-only: %+6.2f%%; "
+           "adapter overhead vs direct: %+6.2f%%\n",
+           (adapter_ns / gate_ns - 1.0) * 100.0,
+           (adapter_ns / direct_ns - 1.0) * 100.0);
+    printf("  adapter speedup vs old-mutex: %.2fx\n", old_ns / adapter_ns);
     const gate_lane_stats_t* lane_stats =
-        &results[BENCH_GATE][BENCHMARK_SAMPLES / 2].gate_lane_stats;
+        &results[BENCH_ADAPTER][BENCHMARK_SAMPLES / 2].gate_lane_stats;
     printf("  lane assignment: assigned=%zu, occupied=%zu/%u, shared_threads=%zu, "
            "extra_collisions=%zu, collision_lanes=%zu, max_threads/lane=%zu\n",
            lane_stats->assigned_threads, lane_stats->occupied_lanes,
