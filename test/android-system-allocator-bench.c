@@ -19,6 +19,7 @@
 // compare Scudo and mimalloc system images.
 
 #include <errno.h>
+#include <fcntl.h>
 #include <malloc.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -38,6 +39,7 @@
 #define MAX_LATENCY_SAMPLES 32768U
 #define LATENCY_SAMPLE_INTERVAL 1009U
 #define CLOCK_CHECK_INTERVAL 256U
+#define PURGE_SERIES_COUNT 16U
 
 #define BENCHMARK_SAMPLES 5U
 #define BENCHMARK_DURATION_NS 1000000000ULL
@@ -106,16 +108,16 @@ typedef struct benchmark_result_s {
   memory_stats_t before;
   memory_stats_t workload_end;
   memory_stats_t after_free;
-  memory_stats_t after_purge;
+  memory_stats_t after_purge[PURGE_SERIES_COUNT];
   memory_stats_t after_purge_all;
   memory_stats_t after_thread_exit;
   long minor_faults;
   long major_faults;
   long voluntary_switches;
   long involuntary_switches;
-  int purge_result;
+  int purge_result[PURGE_SERIES_COUNT];
   int purge_all_result;
-  uint64_t purge_nanoseconds;
+  uint64_t purge_nanoseconds[PURGE_SERIES_COUNT];
   uint64_t purge_all_nanoseconds;
   uint64_t checksum;
 } benchmark_result_t;
@@ -387,21 +389,37 @@ static void* benchmark_worker(void* argument) {
   return NULL;
 }
 
+static void parse_memory_value(const char* buffer, const char* label, size_t* value) {
+  const char* field = strstr(buffer, label);
+  if (field == NULL) return;
+  field += strlen(label);
+  (void)sscanf(field, ": %zu kB", value);
+}
+
 static memory_stats_t read_memory_stats(void) {
   memory_stats_t stats = {0};
-  FILE* file = fopen("/proc/self/smaps_rollup", "re");
-  if (file == NULL) return stats;
+  int fd = open("/proc/self/smaps_rollup", O_RDONLY | O_CLOEXEC);
+  if (fd == -1) return stats;
 
-  char line[256];
-  while (fgets(line, sizeof(line), file) != NULL) {
-    size_t value = 0;
-    if (sscanf(line, "Rss: %zu kB", &value) == 1) stats.rss_kb = value;
-    if (sscanf(line, "Pss: %zu kB", &value) == 1) stats.pss_kb = value;
-    if (sscanf(line, "Private_Dirty: %zu kB", &value) == 1) {
-      stats.private_dirty_kb = value;
+  // smaps_rollup is small. Keep sampling off the allocator so measuring RSS
+  // between consecutive purge calls does not create work for the next call.
+  char buffer[8192];
+  size_t used = 0;
+  while (used < sizeof(buffer) - 1U) {
+    ssize_t count = read(fd, buffer + used, sizeof(buffer) - 1U - used);
+    if (count > 0) {
+      used += (size_t)count;
+      continue;
     }
+    if (count == -1 && errno == EINTR) continue;
+    break;
   }
-  fclose(file);
+  close(fd);
+  buffer[used] = '\0';
+
+  parse_memory_value(buffer, "Rss", &stats.rss_kb);
+  parse_memory_value(buffer, "Pss", &stats.pss_kb);
+  parse_memory_value(buffer, "Private_Dirty", &stats.private_dirty_kb);
   return stats;
 }
 
@@ -526,12 +544,14 @@ static benchmark_result_t run_benchmark(workload_t workload, size_profile_t prof
   wait_at_barrier(&freed_barrier);
   result.after_free = read_memory_stats();
 
-  uint64_t purge_start = monotonic_nanoseconds();
-  result.purge_result = mallopt(M_PURGE, 0);
-  result.purge_nanoseconds = monotonic_nanoseconds() - purge_start;
-  result.after_purge = read_memory_stats();
+  for (size_t purge = 0; purge < PURGE_SERIES_COUNT; purge++) {
+    uint64_t purge_start = monotonic_nanoseconds();
+    result.purge_result[purge] = mallopt(M_PURGE, 0);
+    result.purge_nanoseconds[purge] = monotonic_nanoseconds() - purge_start;
+    result.after_purge[purge] = read_memory_stats();
+  }
 
-  purge_start = monotonic_nanoseconds();
+  uint64_t purge_start = monotonic_nanoseconds();
   result.purge_all_result = mallopt(M_PURGE_ALL, 0);
   result.purge_all_nanoseconds = monotonic_nanoseconds() - purge_start;
   result.after_purge_all = read_memory_stats();
@@ -614,11 +634,38 @@ static void print_results(workload_t workload, size_profile_t profile, size_t th
          median->workload_end.private_dirty_kb,
          median->after_free.rss_kb, median->after_free.pss_kb,
          median->after_free.private_dirty_kb);
-  printf("  purge: M_PURGE result=%d time=%llu ns rss/pss/private-dirty=%zu/%zu/%zu; "
-         "M_PURGE_ALL result=%d time=%llu ns rss/pss/private-dirty=%zu/%zu/%zu\n",
-         median->purge_result, (unsigned long long)median->purge_nanoseconds,
-         median->after_purge.rss_kb, median->after_purge.pss_kb,
-         median->after_purge.private_dirty_kb, median->purge_all_result,
+  size_t purge_successes = 0;
+  uint64_t purge_total_nanoseconds = 0;
+  uint64_t purge_max_nanoseconds = 0;
+  for (size_t purge = 0; purge < PURGE_SERIES_COUNT; purge++) {
+    if (median->purge_result[purge] == 1) purge_successes++;
+    purge_total_nanoseconds += median->purge_nanoseconds[purge];
+    if (median->purge_nanoseconds[purge] > purge_max_nanoseconds) {
+      purge_max_nanoseconds = median->purge_nanoseconds[purge];
+    }
+  }
+  const memory_stats_t* final_purge =
+      &median->after_purge[PURGE_SERIES_COUNT - 1U];
+  const size_t reclaimed_rss =
+      median->after_free.rss_kb > final_purge->rss_kb
+          ? median->after_free.rss_kb - final_purge->rss_kb
+          : 0;
+  printf("  purge-series: calls=%u successes=%zu total=%llu ns max=%llu ns "
+         "final-rss/pss/private-dirty=%zu/%zu/%zu reclaimed-rss=%zu KiB\n",
+         PURGE_SERIES_COUNT, purge_successes,
+         (unsigned long long)purge_total_nanoseconds,
+         (unsigned long long)purge_max_nanoseconds, final_purge->rss_kb,
+         final_purge->pss_kb, final_purge->private_dirty_kb, reclaimed_rss);
+  printf("  purge-series steps result/time-ns/rss-KiB:");
+  for (size_t purge = 0; purge < PURGE_SERIES_COUNT; purge++) {
+    printf(" %zu=%d/%llu/%zu", purge + 1U, median->purge_result[purge],
+           (unsigned long long)median->purge_nanoseconds[purge],
+           median->after_purge[purge].rss_kb);
+  }
+  printf("\n");
+  printf("  purge-all: result=%d time=%llu ns "
+         "rss/pss/private-dirty=%zu/%zu/%zu\n",
+         median->purge_all_result,
          (unsigned long long)median->purge_all_nanoseconds,
          median->after_purge_all.rss_kb, median->after_purge_all.pss_kb,
          median->after_purge_all.private_dirty_kb);
@@ -659,6 +706,8 @@ int main(void) {
          "single-operation latency\n");
   printf("note: workload-end contains a live set only for churn; local and remote "
          "have already freed their user allocations\n");
+  printf("note: each memory phase runs %u consecutive M_PURGE calls before "
+         "M_PURGE_ALL\n", PURGE_SERIES_COUNT);
 
   for (size_t workload = 0; workload < WORKLOAD_COUNT; workload++) {
     for (size_t profile = 0; profile < PROFILE_COUNT; profile++) {
