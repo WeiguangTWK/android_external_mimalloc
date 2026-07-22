@@ -57,6 +57,12 @@ typedef enum mimalloc_gate_state_e {
 
 typedef struct __attribute__((aligned(MIMALLOC_GATE_CACHE_LINE_SIZE))) mimalloc_gate_lane_s {
   _Atomic(uint32_t) active;
+  // Live usable bytes are maintained independently from the gate state. A
+  // relaxed counter is sufficient: mallinfo is an approximate statistics
+  // interface, and each update still participates in a signed process-wide
+  // total. Keeping it in the already thread-sharded gate lane avoids
+  // bringing back a global allocator hot-path cache line.
+  _Atomic(int64_t) allocated;
 } mimalloc_gate_lane_t;
 
 #ifdef __cplusplus
@@ -83,6 +89,25 @@ void mimalloc_gate_notify_lane_drained(void);
 void mimalloc_gate_disable(void);
 void mimalloc_gate_enable(void);
 
+static inline mimalloc_gate_lane_t* mimalloc_gate_get_lane(void) {
+  if (g_mimalloc_gate_lane == MIMALLOC_GATE_UNASSIGNED_LANE) {
+    g_mimalloc_gate_lane =
+        atomic_fetch_add_explicit(&g_mimalloc_gate_next_lane, 1, memory_order_relaxed) &
+        (MIMALLOC_GATE_LANE_COUNT - 1);
+  }
+  return &g_mimalloc_gate_lanes[g_mimalloc_gate_lane];
+}
+
+static inline void mimalloc_gate_account_allocated(size_t bytes) {
+  mimalloc_gate_lane_t* lane = mimalloc_gate_get_lane();
+  atomic_fetch_add_explicit(&lane->allocated, (int64_t)bytes, memory_order_relaxed);
+}
+
+static inline void mimalloc_gate_account_freed(size_t bytes) {
+  mimalloc_gate_lane_t* lane = mimalloc_gate_get_lane();
+  atomic_fetch_sub_explicit(&lane->allocated, (int64_t)bytes, memory_order_relaxed);
+}
+
 static inline void mimalloc_gate_enter(void) {
   if (g_mimalloc_gate_reentry_depth != 0) {
     g_mimalloc_gate_reentry_depth++;
@@ -95,13 +120,7 @@ static inline void mimalloc_gate_enter(void) {
     state = atomic_load_explicit(&g_mimalloc_gate_state, memory_order_seq_cst);
   }
 
-  if (g_mimalloc_gate_lane == MIMALLOC_GATE_UNASSIGNED_LANE) {
-    g_mimalloc_gate_lane =
-        atomic_fetch_add_explicit(&g_mimalloc_gate_next_lane, 1, memory_order_relaxed) &
-        (MIMALLOC_GATE_LANE_COUNT - 1);
-  }
-
-  mimalloc_gate_lane_t* lane = &g_mimalloc_gate_lanes[g_mimalloc_gate_lane];
+  mimalloc_gate_lane_t* lane = mimalloc_gate_get_lane();
   for (;;) {
     if (state != MIMALLOC_GATE_OPEN) {
       mimalloc_gate_wait_until_open();

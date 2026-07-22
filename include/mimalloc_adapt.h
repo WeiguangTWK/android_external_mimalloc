@@ -36,6 +36,9 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#if defined(HAVE_DEPRECATED_MALLOC_FUNCS)
+#include <unistd.h>
+#endif
 
 #include <async_safe/log.h>
 
@@ -47,6 +50,12 @@ void* mi_malloc(size_t size);
 void* mi_calloc(size_t count, size_t size);
 void* mi_realloc(void* p, size_t newsize);
 void mi_free(void* p);
+void* mi_umalloc(size_t size, size_t* block_size);
+void* mi_ucalloc(size_t count, size_t size, size_t* block_size);
+void* mi_urealloc(void* p, size_t newsize, size_t* block_size_pre,
+                  size_t* block_size_post);
+void mi_ufree(void* p, size_t* block_size);
+void* mi_umalloc_aligned(size_t size, size_t alignment, size_t* block_size);
 size_t mi_malloc_usable_size(const void* p);
 void* mi_memalign(size_t alignment, size_t size);
 int mi_posix_memalign(void** p, size_t alignment, size_t size);
@@ -59,6 +68,7 @@ typedef void mi_output_fun(const char* msg, void* arg);
 void mi_stats_print_out(mi_output_fun* out, void* arg);
 struct mallinfo mimalloc_helper_mallinfo(void);
 struct mallinfo mimalloc_helper_mallinfo_reentrant(void);
+struct mallinfo mimalloc_helper_mallinfo_snapshot(void);
 int mimalloc_helper_malloc_info(FILE* fp, struct mallinfo info);
 void mimalloc_helper_purge_all(void);
 int mimalloc_helper_malloc_iterate(uintptr_t base, size_t size,
@@ -109,14 +119,18 @@ static inline void* mimalloc_aligned_alloc(size_t alignment, size_t size) {
     return NULL;
   }
   mimalloc_operation_begin();
-  void* p = mi_aligned_alloc(alignment, size);
+  size_t usable = 0;
+  void* p = mi_umalloc_aligned(size, alignment, &usable);
+  if (p != NULL) mimalloc_gate_account_allocated(usable);
   mimalloc_operation_end();
   return p;
 }
 
 static inline void* mimalloc_calloc(size_t n_elements, size_t elem_size) {
   mimalloc_operation_begin();
-  void* p = mi_calloc(n_elements, elem_size);
+  size_t usable = 0;
+  void* p = mi_ucalloc(n_elements, elem_size, &usable);
+  if (p != NULL) mimalloc_gate_account_allocated(usable);
   mimalloc_operation_end();
   return p;
 }
@@ -124,25 +138,21 @@ static inline void* mimalloc_calloc(size_t n_elements, size_t elem_size) {
 static inline void mimalloc_free(void* mem) {
   if (mem == NULL) return;
   mimalloc_operation_begin();
-  mi_free(mem);
+  size_t usable = 0;
+  mi_ufree(mem, &usable);
+  mimalloc_gate_account_freed(usable);
   mimalloc_operation_end();
 }
 
 static inline struct mallinfo mimalloc_mallinfo() {
-  if (g_mimalloc_gate_reentry_depth != 0) {
-    return mimalloc_helper_mallinfo_reentrant();
-  }
-  mimalloc_gate_disable();
-  g_mimalloc_gate_reentry_depth = 1;
-  struct mallinfo info = mimalloc_helper_mallinfo();
-  g_mimalloc_gate_reentry_depth = 0;
-  mimalloc_gate_enable();
-  return info;
+  return mimalloc_helper_mallinfo();
 }
 
 static inline void* mimalloc_malloc(size_t bytes) {
   mimalloc_operation_begin();
-  void* p = mi_malloc(bytes);
+  size_t usable = 0;
+  void* p = mi_umalloc(bytes, &usable);
+  if (p != NULL) mimalloc_gate_account_allocated(usable);
   mimalloc_operation_end();
   return p;
 }
@@ -167,7 +177,7 @@ static inline int mimalloc_malloc_info(int options, FILE* fp) {
   } else {
     mimalloc_gate_disable();
     g_mimalloc_gate_reentry_depth = 1;
-    info = mimalloc_helper_mallinfo();
+    info = mimalloc_helper_mallinfo_snapshot();
     g_mimalloc_gate_reentry_depth = 0;
     mimalloc_gate_enable();
   }
@@ -231,36 +241,64 @@ static inline void* mimalloc_memalign(size_t alignment, size_t bytes) {
     return NULL;
   }
   mimalloc_operation_begin();
-  void* p = mi_memalign(alignment, bytes);
+  size_t usable = 0;
+  void* p = mi_umalloc_aligned(bytes, alignment, &usable);
+  if (p != NULL) mimalloc_gate_account_allocated(usable);
   mimalloc_operation_end();
   return p;
 }
 
 static inline void* mimalloc_realloc(void* old_mem, size_t bytes) {
   mimalloc_operation_begin();
-  void* p = mi_realloc(old_mem, bytes);
+  size_t usable_before = 0;
+  size_t usable_after = 0;
+  void* p = mi_urealloc(old_mem, bytes, &usable_before, &usable_after);
+  if (p != NULL) {
+    mimalloc_gate_account_freed(usable_before);
+    mimalloc_gate_account_allocated(usable_after);
+  }
   mimalloc_operation_end();
   return p;
 }
 
 static inline int mimalloc_posix_memalign(void** memptr, size_t alignment, size_t size) {
+  if (memptr == NULL || alignment == 0 || (alignment % sizeof(void*)) != 0 ||
+      (alignment & (alignment - 1)) != 0) {
+    return EINVAL;
+  }
   mimalloc_operation_begin();
-  int result = mi_posix_memalign(memptr, alignment, size);
+  size_t usable = 0;
+  void* p = mi_umalloc_aligned(size, alignment, &usable);
+  int result = 0;
+  if (p == NULL && size != 0) {
+    result = ENOMEM;
+  } else {
+    *memptr = p;
+    mimalloc_gate_account_allocated(usable);
+  }
   mimalloc_operation_end();
   return result;
 }
 
 #if defined(HAVE_DEPRECATED_MALLOC_FUNCS)
 static inline void* mimalloc_pvalloc(size_t bytes) {
+  const size_t page_size = (size_t)getpagesize();
+  if (bytes >= SIZE_MAX - page_size) return NULL;
+  const size_t rounded = (bytes + page_size - 1) & ~(page_size - 1);
   mimalloc_operation_begin();
-  void* p = mi_pvalloc(bytes);
+  size_t usable = 0;
+  void* p = mi_umalloc_aligned(rounded, page_size, &usable);
+  if (p != NULL) mimalloc_gate_account_allocated(usable);
   mimalloc_operation_end();
   return p;
 }
 
 static inline void* mimalloc_valloc(size_t bytes) {
+  const size_t page_size = (size_t)getpagesize();
   mimalloc_operation_begin();
-  void* p = mi_valloc(bytes);
+  size_t usable = 0;
+  void* p = mi_umalloc_aligned(bytes, page_size, &usable);
+  if (p != NULL) mimalloc_gate_account_allocated(usable);
   mimalloc_operation_end();
   return p;
 }

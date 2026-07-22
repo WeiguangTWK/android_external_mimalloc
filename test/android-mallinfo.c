@@ -25,6 +25,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
 
 #define MALLINFO_WORKER_COUNT 4
 #define MALLINFO_ALLOCATION_COUNT 32
@@ -35,6 +38,7 @@
 #define MALLINFO_LARGE_COUNT 3
 #define MALLINFO_LARGE_SIZE ((size_t)768 * 1024 * 1024)
 #define MALLINFO_PUBLIC_ALLOCATION_COUNT 64
+#define MALLINFO_TIMING_CALLS 10000
 
 #define TEST_CHECK(expression)                                                                \
   do {                                                                                        \
@@ -144,6 +148,78 @@ static void test_bionic_public_entrypoint(void) {
   check_mapping_fields(freed);
   TEST_CHECK(allocated.uordblks >= before.uordblks + expected);
   TEST_CHECK(freed.uordblks + expected <= allocated.uordblks);
+}
+
+static void test_adapter_entrypoints(void) {
+  struct mallinfo before = mimalloc_mallinfo();
+  void* calloc_pointer = mimalloc_calloc(32, 1024);
+  void* aligned_pointer = mimalloc_aligned_alloc(4096, 8192);
+  void* memalign_pointer = mimalloc_memalign(2048, 8193);
+  void* posix_pointer = NULL;
+  TEST_CHECK(calloc_pointer != NULL);
+  TEST_CHECK(aligned_pointer != NULL);
+  TEST_CHECK(memalign_pointer != NULL);
+  TEST_CHECK(mimalloc_posix_memalign(&posix_pointer, 1024, 16385) == 0);
+  TEST_CHECK(posix_pointer != NULL);
+
+  calloc_pointer = mimalloc_realloc(calloc_pointer, 128 * 1024);
+  TEST_CHECK(calloc_pointer != NULL);
+  struct mallinfo allocated = mimalloc_mallinfo();
+  TEST_CHECK(allocated.uordblks > before.uordblks);
+
+  void* failed = mimalloc_realloc(calloc_pointer, SIZE_MAX);
+  TEST_CHECK(failed == NULL);
+  TEST_CHECK(mimalloc_mallinfo().uordblks == allocated.uordblks);
+
+  mimalloc_free(calloc_pointer);
+  mimalloc_free(aligned_pointer);
+  mimalloc_free(memalign_pointer);
+  mimalloc_free(posix_pointer);
+  TEST_CHECK(mimalloc_mallinfo().uordblks == before.uordblks);
+}
+
+static void test_fork_preserves_accounting(void) {
+  struct mallinfo before = mimalloc_mallinfo();
+  void* pointer = mimalloc_malloc(256 * 1024);
+  TEST_CHECK(pointer != NULL);
+  const size_t usable = mimalloc_malloc_usable_size(pointer);
+  struct mallinfo allocated = mimalloc_mallinfo();
+  TEST_CHECK(allocated.uordblks >= before.uordblks + usable);
+
+  pid_t pid = fork();
+  TEST_CHECK(pid >= 0);
+  if (pid == 0) {
+    struct mallinfo inherited = mimalloc_mallinfo();
+    TEST_CHECK(inherited.uordblks >= before.uordblks + usable);
+    mimalloc_free(pointer);
+    struct mallinfo freed = mimalloc_mallinfo();
+    TEST_CHECK(freed.uordblks + usable <= inherited.uordblks);
+    _exit(0);
+  }
+
+  int status = 0;
+  TEST_CHECK(waitpid(pid, &status, 0) == pid);
+  TEST_CHECK(WIFEXITED(status));
+  TEST_CHECK(WEXITSTATUS(status) == 0);
+  mimalloc_free(pointer);
+  TEST_CHECK(mimalloc_mallinfo().uordblks == before.uordblks);
+}
+
+static uint64_t monotonic_nanoseconds(void) {
+  struct timespec now;
+  TEST_CHECK(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
+  return (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+}
+
+static void measure_mallinfo_latency(void) {
+  size_t checksum = 0;
+  const uint64_t start = monotonic_nanoseconds();
+  for (size_t i = 0; i < MALLINFO_TIMING_CALLS; i++) {
+    checksum += mimalloc_mallinfo().uordblks;
+  }
+  const uint64_t elapsed = monotonic_nanoseconds() - start;
+  printf("mallinfo hot-path calls=%u average=%.2f ns/call checksum=%zu\n",
+         MALLINFO_TIMING_CALLS, (double)elapsed / MALLINFO_TIMING_CALLS, checksum);
 }
 
 static void* allocation_worker(void* argument) {
@@ -312,9 +388,12 @@ static void test_concurrent_snapshots(void) {
 }
 
 int main(void) {
+  test_adapter_entrypoints();
+  test_fork_preserves_accounting();
   test_live_thread_allocations();
   test_larger_than_int_max();
   test_concurrent_snapshots();
   test_bionic_public_entrypoint();
+  measure_mallinfo_latency();
   return 0;
 }

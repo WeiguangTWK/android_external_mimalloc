@@ -1,5 +1,4 @@
 #include "mimalloc.h"
-#include "mimalloc-stats.h"
 #include "mimalloc_android_gate.h"
 #include "mimalloc/types.h"
 
@@ -96,6 +95,8 @@ static void mimalloc_gate_atfork_child(void) {
   for (size_t i = 0; i < MIMALLOC_GATE_LANE_COUNT; i++) {
     atomic_store_explicit(&g_mimalloc_gate_lanes[i].active, 0, memory_order_seq_cst);
   }
+  // Do not clear lane->allocated: every live parent allocation is inherited
+  // by the child even though only the calling thread survives fork.
   g_mimalloc_gate_reentry_depth = 0;
   atomic_store_explicit(&g_mimalloc_gate_state, MIMALLOC_GATE_OPEN, memory_order_seq_cst);
 }
@@ -378,13 +379,7 @@ static void mimalloc_snapshot_all_delayed_frees(
   }
 }
 
-static size_t mimalloc_main_stat_current(const mi_stat_count_t* stat) {
-  int64_t current =
-      mi_atomic_loadi64_relaxed((_Atomic(int64_t)*)&stat->current);
-  return (current > 0 ? (size_t)current : 0);
-}
-
-mi_decl_export struct mallinfo mimalloc_helper_mallinfo(void) {
+mi_decl_export struct mallinfo mimalloc_helper_mallinfo_snapshot(void) {
   struct mallinfo info = {};
   mimalloc_mallinfo_snapshot_t snapshot = {};
   mimalloc_visit_all_segments(mimalloc_snapshot_segment, &snapshot);
@@ -405,16 +400,43 @@ mi_decl_export struct mallinfo mimalloc_helper_mallinfo(void) {
   return info;
 }
 
-mi_decl_export struct mallinfo mimalloc_helper_mallinfo_reentrant(void) {
+mi_decl_export struct mallinfo mimalloc_helper_mallinfo(void) {
   struct mallinfo info = {};
-  info.uordblks = mimalloc_main_stat_current(&_mi_stats_main.malloc_normal);
-  mimalloc_saturating_add(
-      &info.uordblks, mimalloc_main_stat_current(&_mi_stats_main.malloc_huge));
-  // A reentrant call cannot safely take a process-wide page snapshot. With no
-  // reusable-capacity estimate available, Heap Size equals known live bytes.
+  uint64_t allocated = 0;
+  uint64_t freed = 0;
+  for (size_t i = 0; i < MIMALLOC_GATE_LANE_COUNT; i++) {
+    const int64_t lane = atomic_load_explicit(&g_mimalloc_gate_lanes[i].allocated,
+                                              memory_order_relaxed);
+    if (lane >= 0) {
+      const uint64_t value = (uint64_t)lane;
+      allocated = (value > UINT64_MAX - allocated ? UINT64_MAX : allocated + value);
+    } else {
+      // Avoid negating INT64_MIN. A lane can be negative when this thread
+      // frees memory allocated by a thread assigned to a different lane.
+      const uint64_t value = (uint64_t)(-(lane + 1)) + 1;
+      freed = (value > UINT64_MAX - freed ? UINT64_MAX : freed + value);
+    }
+  }
+  const uint64_t live = (allocated > freed ? allocated - freed : 0);
+#if SIZE_MAX < UINT64_MAX
+  if (live > SIZE_MAX) {
+    info.uordblks = SIZE_MAX;
+  } else {
+    info.uordblks = (size_t)live;
+  }
+#else
+  info.uordblks = (size_t)live;
+#endif
+  // Without walking every page we do not know how much committed memory is
+  // immediately reusable. Android's hot users need live bytes, so report no
+  // reusable estimate and make capacity equal to the known live allocation.
   info.hblkhd = info.uordblks;
   info.usmblks = info.uordblks;
   return info;
+}
+
+mi_decl_export struct mallinfo mimalloc_helper_mallinfo_reentrant(void) {
+  return mimalloc_helper_mallinfo();
 }
 
 mi_decl_export int mimalloc_helper_malloc_info(FILE* fp, struct mallinfo info) {
