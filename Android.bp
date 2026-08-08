@@ -42,6 +42,7 @@ common_cflags = [
     "-D__linux__",
     "-D__ANDROID__",
     "-DMI_VISIT_ABANDONED",
+    "-DMI_SECURE=4",
 
     // The following flags are for avoiding errors when compiling.
     "-Wno-static-in-inline",
@@ -66,14 +67,17 @@ cc_defaults {
     local_include_dirs: common_c_local_includes,
     header_libs: [
         "libc_headers",
+        "libasync_safe_headers",
     ],
-    export_header_lib_headers: ["libc_headers"],
+    export_header_lib_headers: [
+        "libc_headers",
+        "libasync_safe_headers",
+    ],
     stl: "none",
 }
 
 lib_srcs = [
-    "src/static.c",
-    "src/android-adapt.c",
+    "src/android-static.c",
 ]
 
 cc_library {
@@ -143,5 +147,98 @@ cc_test {
     static_libs: ["libmimalloc"],
     srcs: [
         "test/test-api.c",
+    ],
+}
+
+cc_test {
+    name: "mimalloc-test-android-gate",
+    defaults: ["mimalloc_defaults"],
+    gtest: false,
+    static_libs: ["libmimalloc"],
+    srcs: [
+        "test/android-gate.c",
+    ],
+}
+
+cc_test {
+    name: "mimalloc-bench-android-gate",
+    defaults: ["mimalloc_defaults"],
+    gtest: false,
+    static_libs: ["libmimalloc"],
+    srcs: [
+        "test/android-gate-bench.c",
+    ],
+}
+
+// This benchmark intentionally does not inherit mimalloc_defaults and does
+// not link libmimalloc. The same binary therefore exercises the allocator
+// exported by the device libc, allowing direct comparisons between Scudo and
+// mimalloc system images.
+cc_test {
+    name: "malloc-bench-android-system",
+    gtest: false,
+    compile_multilib: "64",
+    cflags: [
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-fno-builtin-malloc",
+        "-fno-builtin-calloc",
+        "-fno-builtin-realloc",
+        "-fno-builtin-free",
+    ],
+    srcs: [
+        "test/android-system-allocator-bench.c",
+    ],
+}
+
+cc_test {
+    name: "mimalloc-test-android-iterate",
+    defaults: ["mimalloc_defaults"],
+    gtest: false,
+    static_libs: ["libmimalloc"],
+    srcs: [
+        "test/android-iterate.c",
+    ],
+}
+
+cc_test {
+    name: "mimalloc-test-android-purge",
+    defaults: ["mimalloc_defaults"],
+    gtest: false,
+    static_libs: ["libmimalloc"],
+    srcs: [
+        "test/android-purge.c",
+    ],
+}
+
+cc_test {
+    name: "mimalloc-test-android-mallinfo",
+    defaults: ["mimalloc_defaults"],
+    gtest: false,
+    static_libs: ["libmimalloc"],
+    srcs: [
+        "test/android-mallinfo.c",
+    ],
+}
+
+cc_test {
+    name: "mimalloc-test-android-malloc-info",
+    defaults: ["mimalloc_defaults"],
+    gtest: false,
+    static_libs: ["libmimalloc"],
+    srcs: [
+        "test/android-malloc-info.c",
+    ],
+}
+
+cc_test {
+    name: "mimalloc-test-android-mallopt",
+    defaults: ["mimalloc_defaults"],
+    gtest: false,
+    static_libs: ["libmimalloc"],
+    srcs: [
+        "test/android-mallopt.c",
     ],
 }
